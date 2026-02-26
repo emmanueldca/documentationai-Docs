@@ -1,5 +1,5 @@
 {
-  "name": "Starter Kit",
+  "name": "CCMS",
   "colors": {
     "light": {
       "brand": "#F97316"
@@ -11,141 +11,110 @@
   "navigation": {
     "tabs": [
       {
-        "tab": "Documentation",
+        "tab": "CCMS",
         "icon": "book",
         "groups": [
           {
-            "group": "Start Here",
+            "group": "Start here",
             "icon": "rocket",
             "pages": [
               {
-                "title": "Introduction",
-                "path": "introduction",
+                "title": "CCMS overview",
+                "path": "ccms-overview",
                 "icon": "home"
               },
               {
-                "title": "Quickstart",
-                "path": "quickstart",
-                "icon": "zap"
-              },
-              {
-                "title": "Components",
-                "path": "components",
-                "icon": "code"
+                "title": "Architecture and content flow",
+                "path": "ccms-architecture-content-flow",
+                "icon": "book-open"
               }
             ]
           },
           {
-            "group": "Components",
+            "group": "Repository structure",
+            "icon": "folder",
+            "pages": [
+              {
+                "title": "Repository structure and boundaries",
+                "path": "ccms-repository-structure",
+                "icon": "folder"
+              }
+            ]
+          },
+          {
+            "group": "Frontend",
+            "icon": "layout",
+            "pages": [
+              {
+                "title": "Frontend architecture",
+                "path": "ccms-frontend",
+                "icon": "layout"
+              }
+            ]
+          },
+          {
+            "group": "Backend",
+            "icon": "database",
+            "pages": [
+              {
+                "title": "MWP plugin (WordPress multisite)",
+                "path": "ccms-backend-mwp-plugin",
+                "icon": "database"
+              }
+            ]
+          },
+          {
+            "group": "Data model",
             "icon": "layers",
             "pages": [
               {
-                "title": "Images",
-                "path": "components/images",
-                "icon": "image"
-              },
-              {
-                "title": "Cards",
-                "path": "components/cards",
-                "icon": "square"
-              },
-              {
-                "title": "Code",
-                "path": "components/code",
-                "icon": "code"
-              },
-              {
-                "title": "Callouts",
-                "path": "components/callouts",
-                "icon": "message-square"
-              },
-              {
-                "title": "Steps",
-                "path": "components/steps",
-                "icon": "list-ordered"
-              },
-              {
-                "title": "Tabs",
-                "path": "components/tabs",
-                "icon": "columns"
-              }
-            ]
-          }
-        ]
-      },
-      {
-        "tab": "API Reference",
-        "icon": "code",
-        "groups": [
-          {
-            "group": "Overview",
-            "icon": "file-text",
-            "pages": [
-              {
-                "title": "Authentication",
-                "path": "authentication",
-                "icon": "lock"
+                "title": "Data model and persistence",
+                "path": "ccms-data-model-persistence",
+                "icon": "layers"
               }
             ]
           },
           {
-            "group": "Sample Endpoints",
-            "openapi": "openapi.yaml"
-          }
-        ]
-      },
-      {
-        "tab": "Help Center",
-        "icon": "help-circle",
-        "pages": [
-          {
-            "title": "Help Center",
-            "path": "help-center",
-            "icon": "home"
-          },
-          {
-            "group": "FAQs",
-            "icon": "help-circle",
-            "expandable": false,
+            "group": "Runtime and operations",
+            "icon": "settings",
             "pages": [
               {
-                "title": "Documentation Source",
-                "path": "help-center/faq/getting-started"
+                "title": "Runtime and environment setup",
+                "path": "ccms-runtime-environments",
+                "icon": "settings"
+              },
+              {
+                "title": "Logging and monitoring",
+                "path": "ccms-logging-monitoring",
+                "icon": "terminal"
+              },
+              {
+                "title": "Error handling and failure scenarios",
+                "path": "ccms-error-handling-failure-scenarios",
+                "icon": "alert-circle"
+              },
+              {
+                "title": "Build and release",
+                "path": "ccms-build-release",
+                "icon": "git-branch"
+              },
+              {
+                "title": "Operational runbooks",
+                "path": "ccms-operational-runbooks",
+                "icon": "wrench"
               }
             ]
           },
           {
-            "group": "Troubleshooting",
-            "icon": "alert-triangle",
-            "expandable": false,
+            "group": "Security",
+            "icon": "shield",
             "pages": [
               {
-                "title": "Page Missing in Sidebar",
-                "path": "help-center/troubleshooting/install-error"
+                "title": "Security and access model",
+                "path": "ccms-security-access-model",
+                "icon": "shield"
               }
             ]
-          },
-          {
-            "group": "Guides",
-            "icon": "book-open",
-            "expandable": false,
-            "pages": [
-              {
-                "title": "Create Your First Page",
-                "path": "help-center/guides/setup-project"
-              }
-            ]
-          }
-        ]
-      },
-      {
-        "tab": "Changelog",
-        "icon": "clock",
-        "pages": [
-          {
-            "title": "Changelog",
-            "path": "changelog",
-            "icon": "history"
           }
         ]
       }

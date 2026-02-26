@@ -1,0 +1,428 @@
+---
+title: CCMS repository structure and boundaries
+description: Understand the HeadlessHub CCMS repo layout, core boundaries, and which components are safe to change versus those requiring impact analysis.
+---
+
+## Overview
+
+CCMS lives in the `HeadlessHub/HeadlessHub` repository, split into a WordPress backend plugin and a Next.js frontend, plus CI/CD and local dev tooling. This guide maps the structure, explains responsibilities, and highlights sensitive areas that require impact analysis before you change them.
+
+<Callout kind="info">
+
+Treat this page as the canonical reference for "where things live" in the CCMS stack and who owns which boundary (frontend, backend, infra).
+
+</Callout>
+
+---
+
+## Top-level repository layout
+
+The root of the repo contains a small number of directories and files that define the overall system:
+
+- **`back/`** – WordPress plugin code for CCMS (MWP).
+- **`front/`** – Next.js 15 frontend application.
+- **`.github/workflows/`** – CI/CD automation and deployment workflows.
+- **`docker-compose.yml`** – Local development stack (WordPress, MySQL, Adminer, etc.).
+- **`.env.sample`** – Sample environment variables for local dev, including ports and credentials.
+- **`README.md` files** – High-level docs in the root, `back/mwp`, and `front`.
+
+Each area has a distinct responsibility and a different risk profile when you modify it.
+
+---
+
+## Backend: `back/` and MWP plugin
+
+The backend is a WordPress plugin that exposes CCMS-specific GraphQL schema and coordinates with the frontend for routing, SEO, and revalidation.
+
+### `back/mwp`: core plugin
+
+`back/mwp` contains the MWP plugin code. The main entrypoint and core components are:
+
+- **`back/mwp/mwp.php`** – Plugin bootstrap.
+- **`back/mwp/src/Graphql.php`** – CCMS GraphQL schema extensions.
+- **`back/mwp/src/Revalidation.php`** – Revalidation logic for triggering frontend ISR.
+- **`back/mwp/src/Admin/Pages/OnDemandRevalidation.php`** – Admin UI for on-demand revalidation.
+
+<Callout kind="alert">
+
+`mwp.php`, `Graphql.php`, and `Revalidation.php` are **foundational backend components**. Changing their behavior affects routing data, SEO metadata, and cache invalidation across the entire frontend. Always perform impact analysis and coordinate with frontend owners before modifying them.
+
+</Callout>
+
+#### `back/mwp/mwp.php` – plugin bootstrap
+
+- Loads the plugin autoloader and wires up:
+  - Settings.
+  - Revalidation integration.
+  - GraphQL extensions.
+- Defines how the plugin initializes within WordPress, including hooks and service registration.
+
+When you need to:
+
+- **Add a new core service or subsystem** → register it here, following the existing initialization pattern.
+- **Change plugin lifecycle (activation/deactivation)** → review all components that are initialized in `mwp.php` to avoid breaking dependencies.
+
+#### `back/mwp/src/Graphql.php` – GraphQL schema extensions
+
+This file defines CCMS-specific additions to the GraphQL schema, including:
+
+- `mwpSettings` – configuration surfaced to the frontend.
+- `mwpRouting` / `redirect` – routing and redirect data consumed by the Next.js app.
+- `mwpSeo` – SEO metadata for pages and routes.
+
+<Callout kind="alert">
+
+Schema changes in `Graphql.php` can **break frontend queries** under `front/app/lib/server/graphql/**` and any `.gql` documents. Before changing field names or arguments, search for dependent queries and plan a migration.
+
+</Callout>
+
+#### `back/mwp/src/Revalidation.php` and Admin revalidation page
+
+Revalidation components coordinate with the frontend ISR endpoints:
+
+- `Revalidation.php` – calls out to the frontend revalidation API when content changes.
+- `Admin/Pages/OnDemandRevalidation.php` – allows admins to manually trigger revalidation.
+
+These files encapsulate:
+
+- How and when revalidation requests are sent.
+- Which frontend routes are affected.
+- Authentication or secret handling for the revalidation API.
+
+Treat revalidation endpoints in the frontend and this backend logic as a coupled boundary (see frontend section below).
+
+---
+
+## Frontend: `front/` Next.js application
+
+The frontend is a Next.js 15 App Router application that consumes the CCMS GraphQL API and implements routing, templates, and ISR behavior.
+
+Key areas:
+
+- **`front/app/[[...route]]/`** – catch-all routing and core layout.
+- **`front/app/api/revalidate/route.ts`** – ISR revalidation API.
+- **`front/app/api/preview/route.ts`** – preview mode API.
+- **`front/app/lib/server/graphql/`** – Apollo client setup and GraphQL operations.
+
+### Catch-all routing: `front/app/[[...route]]/`
+
+This directory uses Next.js App Router with a catch-all segment `[[...route]]` to handle most frontend routing:
+
+- `layout` and `page` in this folder map arbitrary paths to content resolved via GraphQL (`mwpRouting`, `redirect`, etc.).
+- This is where URL structure, 404/redirect behavior, and global layout for routed pages are defined.
+
+<Callout kind="alert">
+
+The `[[...route]]` catch-all is a **foundational routing component**. Any change to how it resolves content or interprets `mwpRouting` data impacts **all user-facing pages**. Coordinate with backend owners when changing the routing logic or the expected shape of routing data.
+
+</Callout>
+
+Safe vs sensitive changes:
+
+- **Safe-ish:**
+  - Styling and layout structure that does not change data requirements.
+  - Adding presentational components that use existing props.
+- **Sensitive:**
+  - Changing how `route` params map to GraphQL queries.
+  - Altering redirect logic.
+  - Adding new data requirements that require backend schema changes.
+
+### Operational APIs: revalidation and preview
+
+Two API routes under `front/app/api` are tightly coupled with the backend plugin:
+
+- **`front/app/api/revalidate/route.ts`**
+  - Receives revalidation triggers from `Revalidation.php` and the admin page.
+  - Calls Next.js revalidation APIs for affected paths.
+- **`front/app/api/preview/route.ts`**
+  - Enables preview mode, typically based on tokens or parameters from WordPress.
+
+<Callout kind="alert">
+
+`revalidate/route.ts` and `preview/route.ts` are **critical integration points** between WordPress and Next.js. Changes to their URL, auth mechanism, or payload shape require coordinated updates in the backend plugin and possibly infrastructure (secrets, environment variables).
+
+</Callout>
+
+### GraphQL client and operations: `front/app/lib/server/graphql/`
+
+This folder hosts the Apollo client configuration and GraphQL queries/fragments:
+
+- **`apollo.ts`** – Apollo client setup and connectivity to the WordPress GraphQL endpoint.
+- `*.gql` files – query documents and fragments used across the app.
+
+Responsibilities:
+
+- Define how the frontend talks to the backend (`endpoint`, headers, auth).
+- Centralize GraphQL queries so they stay in sync with `Graphql.php`.
+
+<Callout kind="info">
+
+Treat `.gql` documents as the **frontend contract** for the backend schema. When deprecating or renaming fields in `Graphql.php`, update these queries first or provide compatibility fields.
+
+</Callout>
+
+Safe vs sensitive changes:
+
+- **Safe-ish:**
+  - Adding new queries and fragments.
+  - Extending existing queries with **backward-compatible** fields.
+- **Sensitive:**
+  - Changing the endpoint or auth in `apollo.ts`.
+  - Removing or renaming fields used by existing components without deprecation.
+
+### Presentation and templates
+
+Most React components, page-level templates, and design system pieces under `front/` (outside the areas above) are **safe to modify** as long as you:
+
+- Do not change required data contracts without coordinating with backend owners.
+- Keep routing and operational logic in the dedicated core areas.
+
+These are typically:
+
+- Co-located page components under `front/app/**` that render content from GraphQL.
+- Shared UI components, layout wrappers, and styles.
+
+Focus template and visual changes here rather than in the routing or integration layers.
+
+---
+
+## CI/CD and infrastructure: `.github/workflows/`
+
+The `.github/workflows` directory contains:
+
+- **`front_build.yaml`** – frontend build pipeline.
+- **`front_deploy_*.yaml`** – environment-specific frontend deployment workflows.
+- **Semantic version workflow** – manages version tagging and release automation.
+
+<Callout kind="alert">
+
+Deployment workflows are **infrastructure-critical**. Mistakes here can block deploys or push incorrect artifacts to production. Coordinate with DevOps/infra owners before changing triggers, environment mappings, or deployment commands.
+
+</Callout>
+
+Responsibilities:
+
+- Define how the frontend is built, tested, and deployed.
+- Integrate with environment-specific settings (e.g., production vs staging).
+- Implement semantic versioning and tagging rules.
+
+Safe vs sensitive changes:
+
+- **Safe-ish:**
+  - Adding non-disruptive checks (linters, additional tests) that do not alter deployment steps.
+- **Sensitive:**
+  - Changing deployment targets or credentials.
+  - Modifying build commands that affect artifact contents.
+  - Adjusting branch filters/tags that control what goes to which environment.
+
+---
+
+## Local development: `docker-compose.yml` and `.env.sample`
+
+Local dev tooling is rooted in the repository, not in `back/` or `front/`:
+
+- **`docker-compose.yml`**
+  - Spins up WordPress, MySQL, Adminer, and any other required services.
+  - Hard-codes ports and basic configuration for local use only.
+- **`.env.sample`**
+  - Documents required environment variables and default values for local setup (MySQL credentials, WP admin details, ports for Node/Next.js, etc.).
+
+<Callout kind="info">
+
+Use `docker-compose.yml` and `.env.sample` as references for onboarding and local debugging. For non-local environments, respect the values and patterns defined in CI/CD and deployment configs instead.
+
+</Callout>
+
+Safe vs sensitive changes:
+
+- **Safe-ish:**
+  - Clarifying comments.
+  - Updating `.env.sample` defaults that do not conflict with shared onboarding docs.
+- **Sensitive:**
+  - Changing port mappings used in onboarding or CI.
+  - Modifying service names or networks that other scripts/workflows expect.
+
+---
+
+## Foundational vs safe-to-modify areas
+
+This section summarizes which parts of the repo are foundational (high impact) versus relatively safe for routine changes.
+
+### Foundational components (high-impact)
+
+These require impact analysis, regression testing, and cross-team coordination before changes:
+
+- **Backend**
+  - `back/mwp/mwp.php` – plugin bootstrap and initialization.
+  - `back/mwp/src/Graphql.php` – schema for `mwpSettings`, `mwpRouting`, `redirect`, `mwpSeo`, etc.
+  - `back/mwp/src/Revalidation.php` – revalidation integration.
+  - `back/mwp/src/Admin/Pages/OnDemandRevalidation.php` – admin revalidation UI affecting ISR behavior.
+
+- **Frontend**
+  - `front/app/[[...route]]/` – core URL resolution and routing behavior.
+  - `front/app/api/revalidate/route.ts` – ISR revalidation endpoint.
+  - `front/app/api/preview/route.ts` – preview API.
+  - `front/app/lib/server/graphql/apollo.ts` – GraphQL client configuration.
+
+- **Infra**
+  - `.github/workflows/front_build.yaml` – frontend build pipeline.
+  - `.github/workflows/front_deploy_*.yaml` – environment deploy workflows.
+  - Semantic version workflow under `.github/workflows`.
+
+<Callout kind="alert">
+
+Before modifying any file in this list, answer:  
+1) Which other components depend on this behavior?  
+2) Which environments are affected (local, staging, production)?  
+3) How will we validate the change end-to-end?
+
+</Callout>
+
+### Safe-to-modify templates and presentation
+
+Changes that are generally safe when scoped carefully:
+
+- React components and templates under `front/app/**` that:
+  - Only change styling or markup.
+  - Use existing GraphQL data without altering contracts.
+- Shared UI libraries, CSS/utility modules, and design tokens.
+- New `.gql` queries and fragments that **only add fields** and do not break existing ones.
+- Local-only developer experience:
+  - Comments or docs in `docker-compose.yml`.
+  - Non-breaking updates to `.env.sample` (e.g., adding new optional variables).
+
+When in doubt, prefer to introduce new components or props rather than repurposing existing ones with different semantics.
+
+---
+
+## Where to start when changing X
+
+Use this section as a quick entry point when you have a specific type of change in mind.
+
+### Content model change (new fields, types, or metadata)
+
+Goal: Add or modify content that the frontend consumes via GraphQL (e.g., new SEO field, routing attribute, or settings option).
+
+1. **Define backend schema changes**
+
+   - Start with **`back/mwp/src/Graphql.php`**:
+     - Add or extend types, fields, and resolvers under the relevant areas (`mwpSettings`, `mwpRouting`, `mwpSeo`, etc.).
+   - Confirm that WordPress stores the underlying data (custom fields, options, post meta).
+
+2. **Update frontend queries**
+
+   - Locate relevant GraphQL documents under `front/app/lib/server/graphql/**`:
+     - Add the new fields to the appropriate `.gql` queries/fragments.
+   - Ensure affected components under `front/app/**` handle the new data.
+
+3. **Validate contracts**
+
+   - Run the frontend against a local or staging WordPress instance.
+   - Check that queries succeed and that pages render with the new content model applied.
+
+<Callout kind="info">
+
+For **backward-incompatible** changes (field removals/renames), keep old fields temporarily and deprecate them across both `Graphql.php` and `.gql` usage before final removal.
+
+</Callout>
+
+### Routing change (URL structure, redirects, or route resolution)
+
+Goal: Change how URLs map to content or how redirects are handled.
+
+1. **Review routing data in backend**
+
+   - Inspect **`back/mwp/src/Graphql.php`** for:
+     - `mwpRouting` and any redirect-related resolvers.
+   - If routing metadata lives in WordPress, ensure editors can manage it correctly.
+
+2. **Adjust frontend catch-all logic**
+
+   - Update **`front/app/[[...route]]/`**:
+     - Change how route segments are interpreted.
+     - Update how GraphQL routing data is consumed.
+   - Update any shared helpers used by this folder to transform route data.
+
+3. **Update redirects and 404 handling**
+
+   - Confirm redirect logic uses the updated GraphQL contract.
+   - Test 404s and edge cases where content does not exist.
+
+<Callout kind="alert">
+
+Routing changes affect **SEO and deep links**. Always test a sample of existing URLs and redirects in a staging environment before deploying.
+
+</Callout>
+
+### Template or presentation change (layout, design, components)
+
+Goal: Change how pages look or how content is presented without altering core routing or content contracts.
+
+1. **Locate the relevant template**
+
+   - Identify which route or content type you are working on.
+   - Find the corresponding React components under `front/app/**`:
+     - Often co-located with `page.tsx` or layout files for specific routes.
+     - Avoid modifying `front/app/[[...route]]/` unless you are changing routing behavior.
+
+2. **Implement UI changes**
+
+   - Update JSX, CSS, or shared components as needed.
+   - Ensure you do not remove required props or change expected data shapes.
+
+3. **Verify against real data**
+
+   - Run the local app connected to a CCMS instance.
+   - Check multiple content examples that use the template (different languages, variants, etc.).
+
+<Callout kind="info">
+
+If you discover that a template needs data the current GraphQL query does not provide, add fields in the `.gql` query **first**, then consider whether the backend schema needs extending.
+
+</Callout>
+
+### Build or deploy change (pipelines and environments)
+
+Goal: Change how the frontend is built, tested, or deployed.
+
+1. **Identify the affected workflow**
+
+   - For build changes, start with **`.github/workflows/front_build.yaml`**.
+   - For environment-specific deploys, open **`.github/workflows/front_deploy_*.yaml`**.
+   - For versioning behavior, look for the semantic version workflow in `.github/workflows`.
+
+2. **Scope your change**
+
+   - For **build-only** changes:
+     - Adjust commands (e.g., add a test step) in `front_build.yaml`.
+   - For **deployment** changes:
+     - Update environment names, deployment commands, or artifact paths.
+     - Confirm any secrets or environment-specific configs exist in the target platform.
+
+3. **Test safely**
+
+   - Use non-production branches and environments first.
+   - Verify:
+     - Workflow passes in GitHub Actions.
+     - The correct version deploys to the intended environment.
+
+<Callout kind="alert">
+
+Avoid testing new deploy changes directly on production workflows. Create a **temporary or staging workflow** variant if necessary, then merge once validated.
+
+</Callout>
+
+---
+
+## Ownership and coordination notes
+
+<Callout kind="info">
+
+- **Backend ownership** – `back/mwp/**`, including `mwp.php`, `Graphql.php`, and revalidation components.
+- **Frontend ownership** – `front/app/**`, `front/app/lib/server/graphql/**`.
+- **Infra/DevOps ownership** – `.github/workflows/**`, deployment targets, and non-local environment configuration.
+- **DX/local ownership** – `docker-compose.yml`, `.env.sample`, and root READMEs.
+
+For cross-boundary changes (e.g., revalidation, routing, or schema contracts), involve all relevant owners early to avoid drift between WordPress, Next.js, and CI/CD.
+
+</Callout>

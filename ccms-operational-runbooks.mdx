@@ -1,0 +1,860 @@
+---
+title: CCMS operational runbooks
+description: End-to-end operational runbooks for CCMS, covering health checks, incident triage, and layer-specific diagnosis without vendor involvement.
+---
+
+## Purpose and scope
+
+Use these runbooks to operate CCMS independently, validate health at each layer, and diagnose incidents without depending on external vendors.
+
+The focus is on the standard CCMS stack:
+
+- WordPress and CCMS plugin
+- GraphQL endpoint
+- Frontend runtime and routing
+- Revalidation and cache freshness
+- Preview and draft content
+- Frontend build and deploy workflows
+
+<Callout kind="info">
+
+**Prerequisites**
+
+- Access to WordPress admin (including CCMS plugin settings).
+- Access to the frontend environment URL.
+- Access to logs and metrics for:
+  - WordPress/PHP-FPM and web server
+  - GraphQL endpoint
+  - Frontend runtime and API routes (`/api/revalidate`, `/api/preview`)
+  - CI/CD pipelines for `front` workflows
+  - Docker host running `front/compose.yaml` and `docker-compose.yml`.
+- Ability to restart services and roll back deployments within your own infrastructure.
+
+</Callout>
+
+---
+
+## High-level incident triage and escalation
+
+Start here when you receive any CCMS-related alert or report (content missing, preview broken, pages 404ing, stale content, etc.).
+
+<Steps>
+
+<Step title="Classify the symptom" icon="alert-triangle">
+
+Identify what the user or monitoring system reports:
+
+- **Publishing issues**
+  - New or updated content not visible on the frontend.
+  - Old content still visible after a publish.
+- **Routing/runtime issues**
+  - 404 for a page that exists in WordPress.
+  - 500 or generic error on a subset of pages.
+- **Preview issues**
+  - Preview link redirects but shows a 404.
+  - Preview shows old content or does not enter draft mode.
+- **Authoring-side issues**
+  - WordPress admin errors or plugin settings not saving.
+- **Deployment issues**
+  - Errors immediately after a new frontend release.
+  - Only the latest version of the site is affected, previous was healthy.
+
+Use this classification to choose the relevant runbook in the sections below.
+
+</Step>
+
+<Step title="Check blast radius and impact" icon="bar-chart">
+
+Determine how wide the issue is:
+
+- **Single URL vs many URLs vs entire site**
+  - Single URL often points to malformed content or a specific GraphQL error.
+  - Many URLs in a section suggest a GraphQL schema or query change.
+  - Entire site affected suggests infrastructure, deploy, or global configuration issues.
+- **Single environment vs multiple environments**
+  - Only one environment broken suggests a bad deploy or environment-specific config.
+  - Multiple environments broken suggests shared WordPress/plugin or GraphQL issues.
+
+Use this assessment to decide urgency and whether to trigger rollback for frontend releases.
+
+</Step>
+
+<Step title="Decide escalation boundaries" icon="users">
+
+Keep escalation contained to the correct owning team:
+
+- **Content and plugin configuration**
+  - Misconfigured CCMS plugin, wrong frontend URL, wrong secret keys.
+  - Malformed entries that break GraphQL for a specific node.
+  - Escalate to the **CMS/platform team** owning WordPress/CCMS plugin.
+- **GraphQL schema and queries**
+  - GraphQL endpoint returning errors or changed schema.
+  - Breaking changes in `back/mwp/src/Graphql.php` or related schema registration.
+  - Escalate to the **backend/API team**.
+- **Frontend runtime and deployments**
+  - Build failures, routing issues in `front/app/[[...route]]/page.tsx`.
+  - Errors from Apollo client in `front/app/lib/server/graphql/apollo.ts`.
+  - Revalidation and preview route issues in `/api` handlers.
+  - Escalate to the **frontend/web team**.
+
+If you cannot attribute the incident after following the layer runbooks below, escalate jointly across CMS, backend, and frontend owners.
+
+</Step>
+
+</Steps>
+
+---
+
+## System health validation runbooks
+
+Use these runbooks to validate that each layer of CCMS is healthy. Run them periodically (for example after deploys) or during incident triage.
+
+<ExpandableGroup>
+
+<Expandable title="WordPress and CCMS plugin health">
+
+<Steps>
+
+<Step title="Confirm WordPress is reachable and stable" icon="monitor">
+
+- Open the WordPress admin URL in a browser.
+- Verify you can log in and navigate to:
+  - **Plugins** page.
+  - **CCMS plugin** settings page.
+- Watch for PHP errors, HTTP 5xx, or white screens.
+
+**Success signal:** WordPress admin loads within expected latency and CCMS plugin appears active and configurable.
+
+</Step>
+
+<Step title="Validate CCMS plugin configuration" icon="settings">
+
+Inspect CCMS plugin settings (often surfaced in `mwp_odr_settings` backing options):
+
+- **Frontend URL**
+  - Confirm the value matches the active frontend environment URL.
+  - This is used by `back/mwp/src/Revalidation.php` to call frontend `/api/revalidate`.
+- **Revalidation secret key**
+  - Confirm `revalidate_secret_key` in plugin settings matches `WP_REVALIDATE_SECRET_KEY` used by the frontend.
+- **GraphQL endpoint**
+  - Confirm the URL configured for the frontend exists and responds.
+
+**Success signal:** Plugin shows a saved configuration and you see no validation errors when saving settings.
+
+</Step>
+
+<Step title="Check core GraphQL plugin and CCMS GraphQL integration" icon="database">
+
+- Verify the base GraphQL plugin is active (for example, WPGraphQL).
+- Inspect the CCMS integration logic in `back/mwp/src/Graphql.php`:
+  - Confirm that content types used by the frontend are registered.
+  - Confirm no fatal errors are logged when GraphQL schema is built.
+
+Review server logs for PHP errors on requests to the GraphQL endpoint or on schema generation hooks.
+
+**Success signal:** Hitting the GraphQL endpoint with a basic introspection or `__typename` query returns 200 with valid JSON.
+
+</Step>
+
+<Step title="Review WordPress/PHP logs for systemic issues" icon="terminal">
+
+- Tail or search web server and PHP-FPM logs for:
+  - Recent fatal errors (`E_ERROR`, `E_PARSE`) around the time of incidents.
+  - Errors tied to `Graphql.php`, `Revalidation.php`, or CCMS-specific hooks.
+- Correlate spikes in errors with recent releases or content changes.
+
+If you see consistent fatals during GraphQL execution or plugin hooks, treat as a backend/platform issue and hand off for fix.
+
+</Step>
+
+</Steps>
+
+</Expandable>
+
+<Expandable title="GraphQL endpoint and schema health">
+
+<Steps>
+
+<Step title="Run a basic health query against GraphQL" icon="code">
+
+Use a GraphQL client or CLI to run a minimal query against the WordPress GraphQL endpoint (`WP_ENDPOINT` as used by `apollo.ts`):
+
+```bash
+curl -u "frontend_client:frontend_secret" \
+  -H "Content-Type: application/json" \
+  -d '{"query":"{ __typename }"}' \
+  https://cms.acme.internal/graphql
+```
+
+- Ensure Basic auth credentials match what the frontend uses in `front/app/lib/server/graphql/apollo.ts`.
+- Capture HTTP status, response body, and latency.
+
+**Success signal:** Status 200 and valid JSON with `{"data":{"__typename":"RootQuery"}}` or similar.
+
+</Step>
+
+<Step title="Validate schema for key content types" icon="database">
+
+Query for representative types and fields that the frontend expects, derived from your templates (for example `Page`, `Post`, or custom types):
+
+```bash
+curl -u "frontend_client:frontend_secret" \
+  -H "Content-Type: application/json" \
+  -d '{"query":"{ pages(first: 1) { nodes { id uri title } } }"}' \
+  https://cms.acme.internal/graphql
+```
+
+- Look for:
+  - Missing fields that templates expect.
+  - Null values where data should exist.
+  - `errors` field with details about schema or resolver failures.
+
+**Success signal:** Response contains populated nodes and no top-level `errors`.
+
+</Step>
+
+<Step title="Check for schema or resolver errors in logs" icon="terminal">
+
+Inspect backend logs around GraphQL requests:
+
+- Look for exceptions thrown by code registered in `back/mwp/src/Graphql.php`.
+- Pay special attention to recent changes that:
+  - Introduced new types without updating frontend queries.
+  - Removed fields still queried by the frontend.
+
+If you see frequent resolver errors, coordinate with the backend/API team to restore compatibility or roll back the change.
+
+</Step>
+
+<Step title="Confirm frontend GraphQL client configuration" icon="settings">
+
+Review `front/app/lib/server/graphql/apollo.ts`:
+
+- Confirm `WP_ENDPOINT` points at the correct environment GraphQL endpoint.
+- Confirm Basic auth header (`Authorization: Basic ...`) matches credentials tested above.
+- If multiple environments exist, verify env-specific configuration is correct for the failing environment.
+
+**Success signal:** After confirming configuration, frontend-origin requests to the GraphQL endpoint succeed with no client-auth errors.
+
+</Step>
+
+</Steps>
+
+</Expandable>
+
+<Expandable title="Frontend runtime and routing health">
+
+<Steps>
+
+<Step title="Validate base frontend availability" icon="monitor">
+
+- Open the frontend root URL (for example `https://www.acme-site.com`).
+- Load a small set of pages representing different templates:
+  - Homepage
+  - Simple content page
+  - Deeply nested route
+- Use browser dev tools to:
+  - Check for HTTP 5xx or 404 on page requests.
+  - Inspect console for errors, especially those logged from Apollo or template components.
+
+**Success signal:** Pages render without unhandled exceptions and no systemic 404s.
+
+</Step>
+
+<Step title="Test dynamic route resolution" icon="code">
+
+The catch-all route `front/app/[[...route]]/page.tsx` uses `DynamicPage.getEntity` to resolve content and calls `notFound()` when the entity is missing.
+
+- Navigate to:
+  - A known valid path (should resolve correctly).
+  - A known invalid path (should 404 with your standard not-found page).
+- Review server logs for errors when resolving valid paths:
+  - Apollo errors when fetching entities.
+  - Unexpected exceptions in `DynamicPage` logic.
+
+**Success signal:** Valid paths resolve with content, invalid paths return 404 using `notFound()` behavior, and logs show no uncaught exceptions.
+
+</Step>
+
+<Step title="Check frontend GraphQL errors surfaced in templates" icon="terminal">
+
+Template pages (for example `front/app/template1/pages/Page.tsx`) catch `ApolloError` and log errors before handling missing entities.
+
+- Reproduce problematic pages.
+- Capture logs from the frontend runtime (server-side logs where console output is collected).
+- Look for:
+  - Authentication errors when calling GraphQL.
+  - Schema mismatches or field-not-found errors.
+  - Timeouts or network failures.
+
+Use these signals to decide whether to escalate to backend (GraphQL) or frontend (query/template) owners.
+
+</Step>
+
+<Step title="Confirm environment configuration and secrets" icon="settings">
+
+If frontend runtime shows configuration-related errors:
+
+- Verify environment variables used by the frontend runtime:
+  - GraphQL endpoint (`WP_ENDPOINT`).
+  - GraphQL Basic auth credentials.
+  - Preview and revalidation secrets (`WP_PREVIEW_SECRET_KEY`, `WP_REVALIDATE_SECRET_KEY`).
+- Cross-check these with WordPress plugin settings and deployment configuration (such as `.github/workflows/front_build.yaml` and any environment-specific compose overrides).
+
+**Success signal:** After correcting misconfigurations, pages that previously failed now load successfully without GraphQL or secret-related errors.
+
+</Step>
+
+</Steps>
+
+</Expandable>
+
+<Expandable title="Revalidation and stale content health">
+
+<Steps>
+
+<Step title="Verify revalidation API endpoint" icon="code">
+
+The frontend exposes `/api/revalidate` implemented in `front/app/api/revalidate/route.ts`.
+
+- Send a test request including the required `Authorization` header:
+
+```bash
+curl -i \
+  -H "Authorization: Bearer sk_wp_revalidate_a9f374c01" \
+  "https://www.acme-site.com/api/revalidate?path=/health-check"
+```
+
+- The secret in the `Authorization` header must match `WP_REVALIDATE_SECRET_KEY` and the plugin `revalidate_secret_key`.
+- Confirm the response status and body indicate success or a meaningful error.
+
+**Success signal:** Response is 200 (or your configured success code) and logs show a successful cache invalidation or revalidation operation.
+
+</Step>
+
+<Step title="Confirm backend-to-frontend revalidation wiring" icon="database">
+
+`back/mwp/src/Revalidation.php` is responsible for calling the frontend `/api/revalidate` endpoint using options:
+
+- Verify `mwp_odr_settings.frontend_url`:
+  - Confirm it matches the domain you used above for manual testing.
+- Verify `revalidate_secret_key`:
+  - Confirm it matches `WP_REVALIDATE_SECRET_KEY` in the frontend.
+
+Trigger a content update in WordPress (for example, re-save a test page) and monitor:
+
+- Web server and PHP logs for outbound revalidation requests.
+- Frontend logs for incoming `/api/revalidate` requests matching the updated path.
+
+**Success signal:** Publishing or updating content triggers a request from WordPress to the frontend revalidation endpoint and the respective page reflects new content shortly afterward.
+
+</Step>
+
+<Step title="Detect and confirm stale content issues" icon="alert-triangle">
+
+When users report stale content:
+
+- Compare:
+  - Content visible in WordPress admin.
+  - Content visible on the frontend.
+- Check revalidation logs:
+  - Did `/api/revalidate` receive a request for that path after the latest publish?
+  - Did `Revalidation.php` log any failures (for example, 401/403/500 from frontend)?
+
+If revalidation failed or did not trigger, treat as a revalidation wiring or configuration issue rather than a content authoring problem.
+
+</Step>
+
+<Step title="Run on-demand revalidation as a test" icon="terminal">
+
+If automatic revalidation is unreliable, execute on-demand revalidation:
+
+- Call `/api/revalidate` manually for the affected path using the correct secret.
+- Observe:
+  - Whether the content updates.
+  - Whether the endpoint logs any errors.
+
+If manual revalidation succeeds but automatic does not, focus on WordPress hooks and `Revalidation.php`. If both fail, focus on the frontend API route and environment secrets.
+
+</Step>
+
+</Steps>
+
+</Expandable>
+
+<Expandable title="Preview and draft mode health">
+
+<Steps>
+
+<Step title="Validate preview link behavior end to end" icon="play-circle">
+
+The preview endpoint `front/app/api/preview/route.ts`:
+
+- Validates a `secret` query param against `WP_PREVIEW_SECRET_KEY`.
+- Requires `id` and `type` query params.
+- Enables draft mode and redirects to a preview route.
+- Is marked `dynamic = "force-dynamic"` and `revalidate = 0` to always serve fresh drafts.
+
+Use a preview URL generated from WordPress (for a draft or updated page):
+
+- Confirm the URL includes `secret`, `id`, and `type`.
+- Visit the URL and observe:
+  - Whether the request succeeds without 401/403.
+  - Whether you are redirected to the correct preview route for the entity.
+
+**Success signal:** After visiting the preview link, you see the draft version of the content, and subsequent navigation preserves draft mode for that session.
+
+</Step>
+
+<Step title="Test preview API in isolation" icon="code">
+
+If preview links fail, directly hit `/api/preview`:
+
+```bash
+curl -i \
+  "https://www.acme-site.com/api/preview?secret=sk_wp_preview_92b8f97d&id=page_123&type=page"
+```
+
+- Use a known-good `id` and `type` for a test entity.
+- Ensure `secret` matches `WP_PREVIEW_SECRET_KEY` configured in the frontend environment.
+- Expect:
+  - HTTP 307 or similar redirect to the page preview route.
+  - No caching behavior (revalidate set to 0).
+
+**Success signal:** You receive a redirect to a valid preview URL and the page displays the draft content.
+
+</Step>
+
+<Step title="Check draft mode state and routing" icon="monitor">
+
+Once preview is activated:
+
+- Navigate to multiple pages to confirm draft mode remains active.
+- Validate that:
+  - Draft-only content is visible where expected.
+  - 404 behavior is still correct for non-existent drafts.
+
+If certain templates do not respect draft mode, inspect their data fetching and routing logic:
+
+- Confirm they query using identifiers and modes compatible with preview behavior.
+- Ensure they do not disable draft mode or bypass preview-specific data sources.
+
+</Step>
+
+<Step title="Align WordPress preview configuration with frontend" icon="settings">
+
+If preview consistently fails:
+
+- Check WordPress preview URL templates or CCMS plugin settings that generate preview links.
+- Ensure preview URLs:
+  - Target the correct frontend host and environment.
+  - Include required query params (`secret`, `id`, `type`).
+
+Compare these with logic in `front/app/api/preview/route.ts` to ensure parameter names and semantics align.
+
+**Success signal:** Newly generated preview links from WordPress consistently activate draft mode and redirect correctly.
+
+</Step>
+
+</Steps>
+
+</Expandable>
+
+</ExpandableGroup>
+
+---
+
+## Failure diagnosis by scenario
+
+Use this section when you have a specific failure type. Each runbook maps to signals, logs, and ownership.
+
+<ExpandableGroup>
+
+<Expandable title="Misconfigured WordPress or CCMS plugin settings">
+
+<Steps>
+
+<Step title="Identify configuration-related symptoms" icon="alert-triangle">
+
+Typical indicators:
+
+- Revalidation endpoint never receives requests on content publish.
+- Preview links redirect to the wrong host or return invalid secret errors.
+- Frontend uses the wrong environment (for example, staging instead of production content).
+- GraphQL endpoint configured in the frontend does not match WordPress environment.
+
+If you observe any of these, focus on plugin and environment configuration.
+
+</Step>
+
+<Step title="Review CCMS plugin settings and WP options" icon="settings">
+
+In WordPress admin:
+
+- Open CCMS plugin settings.
+- Cross-check:
+  - `frontend_url` (commonly from `mwp_odr_settings.frontend_url`) against the URL used by the frontend.
+  - `revalidate_secret_key` against `WP_REVALIDATE_SECRET_KEY` in frontend env.
+- Ensure no trailing slashes or protocol mismatches that could break endpoint URLs.
+
+If you change any values, save and note the time for correlation with logs.
+
+</Step>
+
+<Step title="Validate secrets and endpoints from the frontend side" icon="terminal">
+
+From the frontend runtime or deployment configuration:
+
+- Inspect environment variables for:
+  - `WP_REVALIDATE_SECRET_KEY`
+  - `WP_PREVIEW_SECRET_KEY`
+  - `WP_ENDPOINT`
+- Confirm they match the values configured in WordPress/CCMS plugin.
+
+Restart or redeploy the frontend if environment variables changed.
+
+**Success signal:** After alignment, revalidation and preview requests authenticate successfully and target the correct endpoints.
+
+</Step>
+
+<Step title="Confirm end-to-end behavior after fixes" icon="check-circle">
+
+- Publish a test change in WordPress.
+- Observe:
+  - `/api/revalidate` logs and frontend content refresh.
+- Trigger a preview for a draft.
+  - Validate redirect and draft mode.
+
+If behavior is still inconsistent, escalate to CMS/platform and frontend owners jointly, including timestamps and log excerpts.
+
+</Step>
+
+</Steps>
+
+</Expandable>
+
+<Expandable title="Malformed content causing GraphQL or rendering errors">
+
+<Steps>
+
+<Step title="Detect content-specific failures" icon="alert-triangle">
+
+Symptoms often include:
+
+- Only one or a few pages fail with 500, 404, or broken layout.
+- Frontend logs show `ApolloError` or GraphQL validation errors for specific IDs or URIs.
+- GraphQL endpoint returns 200 but with an `errors` array for specific nodes.
+
+Compare a failing URL to a similar one that works to isolate whether the problem is content-specific.
+
+</Step>
+
+<Step title="Inspect GraphQL response for the failing entity" icon="code">
+
+From logs or by manual query:
+
+- Execute the same query used by the frontend for that template, targeting the specific `id` or `uri`.
+- Review:
+  - `errors` array for resolver exceptions or validation messages.
+  - Fields with unexpected nulls or invalid types (for example, expecting a list but receiving a scalar).
+
+If only one node consistently fails, the content itself is likely malformed or missing required relationships.
+
+</Step>
+
+<Step title="Review and correct content in WordPress" icon="edit">
+
+In WordPress:
+
+- Open the corresponding entity (page, post, custom type).
+- Look for:
+  - Required fields left empty.
+  - Invalid references or relationships.
+  - Misconfigured blocks or fields that may violate schema constraints.
+
+Correct the content and re-save.
+
+Trigger revalidation for that path manually (or via publish) and retest the page.
+
+</Step>
+
+<Step title="Validate frontend rendering after content fix" icon="monitor">
+
+Reload the affected page:
+
+- Confirm the error is resolved and logs show successful GraphQL resolution.
+- If the GraphQL result is valid but the page still fails, inspect template logic:
+  - Defensive checks around optional fields.
+  - Handling of empty arrays or nulls.
+
+If template changes are needed, escalate to the frontend team with the example entity and response payload.
+
+</Step>
+
+</Steps>
+
+</Expandable>
+
+<Expandable title="GraphQL schema or query failures">
+
+<Steps>
+
+<Step title="Recognize schema-level failures" icon="alert-triangle">
+
+Common symptoms:
+
+- Multiple pages across templates fail concurrently.
+- GraphQL queries that previously worked now return `Cannot query field` or similar errors.
+- GraphQL introspection or type queries show changed or missing types.
+
+These often follow backend deployments that modify `back/mwp/src/Graphql.php` or related schema configuration.
+
+</Step>
+
+<Step title="Compare failing queries with current schema" icon="code">
+
+- Extract failing GraphQL queries from:
+  - Frontend code (template queries).
+  - Logs produced by `ApolloError` catch blocks.
+- Run them directly against the GraphQL endpoint.
+- Check for:
+  - Field or type names that no longer exist.
+  - Argument changes (for example, renamed or removed arguments).
+
+Document exact error messages and fields involved.
+
+</Step>
+
+<Step title="Inspect backend GraphQL registration code and logs" icon="terminal">
+
+In `back/mwp/src/Graphql.php` and related backend code:
+
+- Look for recent changes to:
+  - Type registrations.
+  - Field additions/removals.
+  - Custom resolvers or directives.
+- Check backend logs for:
+  - Fatal errors during schema build.
+  - Exceptions thrown during resolver execution.
+
+If a recent change removed or renamed fields currently used in frontend queries, this is a breaking change.
+
+</Step>
+
+<Step title="Coordinate fix or rollback with backend owners" icon="users">
+
+Share with the backend/API team:
+
+- The failing queries and responses.
+- Exact GraphQL error messages.
+- Timestamps aligned with deployments.
+
+Agree whether to:
+
+- Restore backward compatibility in the schema.
+- Update frontend queries and templates accordingly.
+- Temporarily roll back backend changes impacting production.
+
+**Success signal:** GraphQL queries used by the frontend execute without schema errors and pages render correctly.
+
+</Step>
+
+</Steps>
+
+</Expandable>
+
+<Expandable title="Frontend build and deploy failures or regressions">
+
+<Steps>
+
+<Step title="Identify build vs runtime vs routing issues" icon="alert-triangle">
+
+Classify the issue:
+
+- **Build-time**
+  - CI/CD pipeline (`.github/workflows/front_build.yaml` or `front_deploy_*.yaml`) fails before deploy.
+- **Deploy-time**
+  - Deployment to the Docker host completes but containers fail to start.
+- **Runtime**
+  - Site is deployed but pages error at runtime or routing behaves unexpectedly.
+
+Use CI/CD logs, Docker logs, and runtime monitoring to distinguish.
+
+</Step>
+
+<Step title="Review CI/CD workflow and build logs" icon="terminal">
+
+In `.github/workflows/front_build.yaml` and associated deploy workflows:
+
+- Confirm:
+  - Frontend builds succeeded.
+  - Tests (if any) passed.
+  - Image tags were generated based on semantic tags `front_vX.Y.Z`.
+- Review logs for:
+  - Unresolved imports.
+  - Type errors in templates or routes.
+  - Environment-specific build failures.
+
+If builds fail, fix at source and re-run pipeline before attempting any deploy.
+
+</Step>
+
+<Step title="Verify deployed image and compose configuration" icon="settings">
+
+On the Docker host:
+
+- Inspect `front/compose.yaml` and `docker-compose.yml`:
+  - Confirm the `image` reference matches the expected tag for the target release.
+  - Confirm env variables (GraphQL endpoint, secrets) are set correctly.
+- Review deploy scripts:
+  - They typically `sed` the image tag in `/var/web/front/compose.yaml`, then run:
+    - `docker-compose pull`
+    - `docker-compose down`
+    - `docker-compose up -d`
+
+Check logs from these commands for errors.
+
+</Step>
+
+<Step title="Validate site behavior after deploy" icon="monitor">
+
+Once deployment reports success:
+
+- Run a smoke test:
+  - Homepage, representative content pages, preview flow, and revalidation endpoint.
+- Watch container logs for:
+  - Startup errors.
+  - GraphQL client failures.
+  - Uncaught exceptions in route handlers and templates.
+
+If regressions are limited to the newly deployed version, prepare to roll back.
+
+</Step>
+
+<Step title="Execute and verify rollback if needed" icon="alert-triangle">
+
+<Callout kind="alert">
+
+Rolling back changes affects all users of the environment and can invalidate recently deployed features. Coordinate timing and verify which tag you are rolling back to.
+
+</Callout>
+
+On the Docker host:
+
+- Edit `front/compose.yaml` (or the appropriate deployment manifest) to use the previous known-good image tag (for example `front_v1.2.3` instead of `front_v1.2.4`).
+- Run:
+
+```bash
+docker-compose pull
+docker-compose down
+docker-compose up -d
+```
+
+- Validate:
+  - Containers start without errors.
+  - Smoke tests pass on the reverted version.
+  - Monitoring metrics return to baseline.
+
+Document the regression and hand off investigation to the frontend team.
+
+</Step>
+
+</Steps>
+
+</Expandable>
+
+<Expandable title="Stale content and revalidation failures">
+
+<Steps>
+
+<Step title="Confirm the content is truly stale" icon="info">
+
+- In WordPress, view the latest published content and note:
+  - Last modified time.
+  - Key fields that changed.
+- On the frontend, hard-refresh (bypass browser cache) or use network tools to ensure you are not seeing cached responses.
+
+If the frontend still shows older content after a reasonable delay, treat this as a revalidation or cache issue.
+
+</Step>
+
+<Step title="Trace the revalidation path per publish" icon="terminal">
+
+For the affected content:
+
+- Check WordPress logs for:
+  - A call from `Revalidation.php` at publish time.
+  - Response status from the frontend `/api/revalidate` endpoint.
+- Check frontend logs for:
+  - Incoming `/api/revalidate` requests matching the content path.
+  - Any errors or revalidation failures.
+
+This will show whether the failure is in WordPress outbound call, network, or frontend endpoint handling.
+
+</Step>
+
+<Step title="Test manual revalidation and compare outcomes" icon="code">
+
+Run manual revalidation:
+
+```bash
+curl -i \
+  -H "Authorization: Bearer sk_wp_revalidate_a9f374c01" \
+  "https://www.acme-site.com/api/revalidate?path=/stale-page"
+```
+
+- Observe:
+  - HTTP status.
+  - Body content (success vs error).
+- Reload the page and confirm content refresh.
+
+**Interpretation:**
+
+- If **manual revalidation works** but automatic does not:
+  - Focus on `Revalidation.php` hooks and WordPress plugin configuration.
+- If **manual revalidation fails**:
+  - Focus on frontend `/api/revalidate` route and env secrets.
+
+</Step>
+
+<Step title="Apply targeted fixes and monitor" icon="check-circle">
+
+Depending on the root cause:
+
+- Fix plugin settings, secret mismatches, or `frontend_url`.
+- Fix frontend route logic or environment configuration.
+- Ensure any caching layer in front of the frontend (if present) respects revalidation behavior.
+
+After fixes:
+
+- Re-publish affected content.
+- Confirm logs show successful automatic revalidation.
+- Verify that stale content reports stop.
+
+</Step>
+
+</Steps>
+
+</Expandable>
+
+</ExpandableGroup>
+
+---
+
+## Ownership and next steps
+
+When you close an incident using these runbooks:
+
+- Record:
+  - Root cause (for example, misconfigured secret, breaking GraphQL change, bad deploy tag).
+  - Affected layer(s) and teams.
+  - Remediation steps applied, including rollbacks.
+- Identify follow-up work:
+  - Hardening tests (for example, CI checks against GraphQL schema compatibility).
+  - Automated health checks hitting:
+    - WordPress and CCMS admin.
+    - GraphQL endpoint.
+    - Frontend core routes.
+    - `/api/revalidate` and `/api/preview`.
+
+Use these runbooks as a baseline and extend them with environment-specific checks and dashboards as your CCMS usage evolves.

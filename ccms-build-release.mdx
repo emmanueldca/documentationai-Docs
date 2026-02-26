@@ -1,0 +1,346 @@
+---
+title: Build and release assumptions for CCMS frontend
+description: Understand how CCMS frontend builds are triggered and promoted, required CI/CD inputs and secrets, build artifacts, deploy model, and common failure conditions.
+---
+
+## Purpose and scope
+
+CCMS frontend builds use a GitHub Actions pipeline to build Docker images and deploy them via `docker-compose` to remote hosts. This page captures the operational assumptions behind that pipeline so you can trigger builds, debug failures, and safely change the workflows.
+
+<Callout kind="info">
+
+This page is descriptive, not authoritative. Treat it as the operational contract between application teams and platform/DevOps for the CCMS frontend CI/CD path.
+
+</Callout>
+
+## High‑level build and promotion model
+
+The frontend CI/CD is split across five workflows:
+
+- `front_stage` — build and push a staging image from pull requests.
+- `front_semantic_version` — apply semantic versioning tags on `main`.
+- `front_build` — build and push production images with version and `latest` tags.
+- `front_deploy_bel2` — deploy the latest production image to the BEL2 frontend host.
+- `front_deploy_lr` — deploy the latest production image to the LR frontend host.
+
+### PR/Staging vs main/Production flows
+
+Use these tabs to compare the staging and production workflows.
+
+<Tabs>
+
+<Tab title="PR / Staging" icon="git-branch">
+
+`front_stage.yaml` runs for pull requests targeting `main` and produces a signed staging image.
+
+- Trigger: pull request opened, synchronized, or reopened against `main`.
+- Output: Docker image in `registry.corp-apps.com/staging/mwp` with an automatic tag (for example, a short SHA).
+- Signature: cosign signs the staging image.
+
+Key characteristics:
+
+- No semantic versioning.
+- No deployment to remote hosts.
+- Intended for reviewers and QA to validate changes before merge.
+
+</Tab>
+
+<Tab title="Main / Production" icon="git-commit">
+
+Production releases are a pipeline of three workflows:
+
+1. `front_semantic_version.yaml` runs on push to `main` and uses semantic-release to create a new tag `front_vX.Y.Z`.
+2. `front_build.yaml` runs after a successful semantic versioning run and builds a production image in `registry.corp-apps.com/image/mwp:${LATEST_TAG}` and `registry.corp-apps.com/image/mwp:latest`, then signs both with cosign.
+3. `front_deploy_bel2.yaml` and `front_deploy_lr.yaml` run after the build, fetch `${LATEST_TAG}`, and deploy the new image to their respective remote hosts via `docker-compose`.
+
+Key characteristics:
+
+- Versioned artefacts suitable for rollback.
+- Cosign signatures on production images.
+- Explicit promotion from build to deploy via separate workflows.
+
+</Tab>
+
+</Tabs>
+
+## End‑to‑end pipeline walkthrough
+
+This section follows a change from pull request to production deployment.
+
+<Steps>
+
+<Step title="Open or update a PR (front_stage build)" icon="github">
+
+A pull request targeting `main` triggers `front_stage.yaml`.
+
+- GitHub Actions checks out the code for the PR.
+- The workflow builds the CCMS frontend Docker image.
+- The image is tagged and pushed to `registry.corp-apps.com/staging/mwp`.
+- cosign signs the staging image after a successful push.
+
+**Success signal:** The workflow completes and the staging registry shows a new image under `staging/mwp` for that commit.
+
+<Callout kind="info">
+
+Assumption: reviewers know which staging environment pulls from `registry.corp-apps.com/staging/mwp` and how to point that environment at a specific tag if needed.
+
+</Callout>
+
+</Step>
+
+<Step title="Merge to main (semantic versioning)" icon="git-merge">
+
+When you merge the PR to `main`, `front_semantic_version.yaml` runs.
+
+- semantic-release inspects commits since the last `front_vX.Y.Z` tag.
+- Based on commit messages, semantic-release decides whether to bump major, minor, or patch.
+- A new Git tag `front_vX.Y.Z` is created and pushed.
+
+**Success signal:** A new `front_vX.Y.Z` tag appears in the repository tags list.
+
+<Callout kind="alert">
+
+High‑risk failure: If commit messages do not follow the expected semantic-release convention, the workflow may skip release or fail to determine the correct version. This blocks `front_build.yaml`, because it depends on the latest tag.
+
+</Callout>
+
+</Step>
+
+<Step title="Build production images (front_build)" icon="package">
+
+After semantic versioning succeeds, `front_build.yaml` builds the production Docker images.
+
+- The workflow identifies `LATEST_TAG` from semantic-release (for example, `front_v1.4.2`).
+- The frontend is built into a Docker image using that code.
+- The image is pushed to:
+  - `registry.corp-apps.com/image/mwp:${LATEST_TAG}`
+  - `registry.corp-apps.com/image/mwp:latest`
+- cosign signs the images in the production registry.
+
+**Success signal:** The registry shows both the versioned and `latest` tags under `image/mwp`, and the workflow marks the cosign signing step as successful.
+
+<Callout kind="alert">
+
+High‑risk failure: If `LATEST_TAG` is missing or malformed (for example, semantic-release did not run or produced an unexpected tag format), `front_build.yaml` fails and no new production image is available for deploy.
+
+</Callout>
+
+</Step>
+
+<Step title="Deploy to BEL2 and LR (front_deploy_bel2 / front_deploy_lr)" icon="rocket">
+
+Deployment workflows `front_deploy_bel2.yaml` and `front_deploy_lr.yaml` run independently after a successful build.
+
+On each remote host:
+
+- The workflow fetches `LATEST_TAG` from the registry or previous workflow state.
+- GitHub Actions pulls necessary secrets from Vault:
+  - SSH private key for the remote host.
+  - Per‑site `.env.local` for the frontend.
+  - Docker registry credentials for `registry.corp-apps.com`.
+- If needed, the workflow copies `docker-compose` and environment files to `/var/web/front` via `scp`.
+- The workflow updates `compose.yaml` on the remote host by running `sed` on the image line to set `registry.corp-apps.com/image/mwp:${LATEST_TAG}`.
+- On the remote host, the workflow runs:
+  - `docker-compose pull`
+  - `docker-compose down`
+  - `docker-compose up -d`
+
+**Success signal:** The workflow completes and `docker ps` on the remote host shows containers running the new `mwp:${LATEST_TAG}` image.
+
+<Callout kind="alert">
+
+High‑risk failure: If the `sed` command does not match the expected image line in `/var/web/front/compose.yaml`, the image tag may not update. The workflow might still succeed while the host continues to run an older image.
+
+</Callout>
+
+</Step>
+
+</Steps>
+
+## CI/CD inputs and required secrets
+
+The workflows assume several inputs and secrets are present and valid.
+
+### Vault‑managed secrets
+
+`front_deploy_bel2.yaml` and `front_deploy_lr.yaml` access secrets from Vault before connecting to the remote hosts.
+
+<Callout kind="info">
+
+Assumption: Vault roles, paths, and policies are already configured for these workflows. GitHub Actions uses preconfigured tokens or authentication methods to read required secrets.
+
+</Callout>
+
+Typical Vault‑backed values:
+
+- **SSH private keys** for the BEL2 and LR frontend hosts.
+- **Per‑site `.env.local`** files containing runtime environment variables for the frontend.
+- **Docker registry credentials** for `registry.corp-apps.com` to perform `docker login` on remote hosts.
+- Optional: **cosign keys** or keyless signing configuration used in `front_stage` and `front_build`.
+
+<Callout kind="alert">
+
+High‑risk failure: If Vault paths change or permissions are revoked, deployment workflows fail at the secret‑fetch step. The pipeline never reaches `docker-compose` and existing deployments continue running the previous image.
+
+</Callout>
+
+### GitHub Actions secrets and configuration
+
+Beyond Vault, the workflows rely on GitHub configuration:
+
+- **Repository access** to fetch tags (`front_semantic_version`) and code (`front_stage`, `front_build`).
+- **Workflow tokens** with permission to:
+  - Push tags (`front_semantic_version`).
+  - Read and write to `registry.corp-apps.com` via Docker login and push (`front_stage`, `front_build`).
+  - Connect via SSH to remote hosts (`front_deploy_bel2`, `front_deploy_lr`).
+
+<Callout kind="info">
+
+Assumption: `registry.corp-apps.com` allows authenticated pushes and pulls from GitHub Action runners and from remote hosts using the credentials provided by Vault.
+
+</Callout>
+
+## Build artefacts and tagging strategy
+
+### Staging images
+
+`front_stage.yaml` publishes non‑versioned, PR‑specific images.
+
+Key properties:
+
+- Registry: `registry.corp-apps.com/staging/mwp`.
+- Tag format: implementation‑specific (for example, short Git SHA or PR number), not guaranteed to be semantic.
+- Signature: cosign signs the staging image.
+
+Usage expectations:
+
+- QA or reviewers reference the staging tag as configured by the staging environment.
+- These images are ephemeral and not used for production.
+
+### Production images
+
+`front_build.yaml` produces release‑quality artefacts for production.
+
+Key properties:
+
+- Registry: `registry.corp-apps.com/image/mwp`.
+- Tags:
+  - **Versioned tag:** `registry.corp-apps.com/image/mwp:${LATEST_TAG}` where `LATEST_TAG` corresponds to `front_vX.Y.Z`.
+  - **Latest tag:** `registry.corp-apps.com/image/mwp:latest`.
+- Signature: cosign signs each production tag.
+
+Operational assumptions:
+
+<Callout kind="info">
+
+Assumption: Deployments should reference the versioned tag in `compose.yaml` (via `LATEST_TAG`) for traceability, even if the `latest` tag exists for convenience or manual testing.
+
+</Callout>
+
+## Deploy model and host layout
+
+### Remote host layout and compose files
+
+Each deployment workflow targets a remote host that maintains frontend containers via `docker-compose`.
+
+On each host (BEL2, LR):
+
+- Compose directory: `/var/web/front`.
+- Files:
+  - `compose.yaml` or `docker-compose.yaml` with a service pointing to `registry.corp-apps.com/image/mwp:...`.
+  - `.env.local` with frontend runtime configuration for that site.
+
+The deployment workflow:
+
+1. Ensures `compose` and env files exist (copies them if missing).
+2. Logs in to `registry.corp-apps.com` using credentials supplied from Vault.
+3. Uses `sed` to update the image reference in `compose.yaml` to match `${LATEST_TAG}`.
+4. Runs `docker-compose pull`, `docker-compose down`, and `docker-compose up -d`.
+
+<Callout kind="alert">
+
+High‑risk failure: Manual edits to `/var/web/front/compose.yaml` that change formatting, indentation, or the image line pattern can break the `sed` substitution. When you adjust compose by hand, keep the image line pattern stable or update the workflow accordingly.
+
+</Callout>
+
+### Image selection and rollback
+
+Because deployments rely on `${LATEST_TAG}`:
+
+- **Normal rollout:** Each new `front_vX.Y.Z` tag becomes the next `${LATEST_TAG}` and is deployed when the deploy workflows run.
+- **Rollback:** To roll back, you must either:
+  - Re‑run the deploy workflow with a previous tag as `${LATEST_TAG}`, or
+  - Manually edit `compose.yaml` to reference the desired older tag and run `docker-compose` commands on the host.
+
+<Callout kind="info">
+
+Assumption: Operational runbooks define how to override `${LATEST_TAG}` when a rollback is required, including who is allowed to make manual changes on the remote hosts.
+
+</Callout>
+
+## Common failure conditions
+
+This section lists typical failure modes grounded in the current workflows.
+
+### Semantic versioning and tagging issues
+
+<Callout kind="alert">
+
+If `front_semantic_version.yaml` fails, `front_build.yaml` has no new `LATEST_TAG` and the production release chain stops.
+
+</Callout>
+
+Common causes:
+
+- Non‑conforming commit messages that semantic-release cannot interpret.
+- Conflicting or missing previous tags `front_vX.Y.Z`.
+- Repository permission issues when pushing tags.
+
+### Registry access and cosign signing
+
+`front_stage.yaml` and `front_build.yaml` need both Docker registry access and cosign configuration.
+
+Potential failures:
+
+- Docker login to `registry.corp-apps.com` fails because of expired or missing credentials.
+- Registry path changes (`staging/mwp` or `image/mwp`) that are not reflected in the workflows.
+- cosign configuration missing or keys not available, causing signing steps to fail.
+
+### Vault or secret retrieval failures
+
+Deployment workflows depend on Vault values.
+
+Potential failures:
+
+- Vault token or auth method used by GitHub Actions is invalid or lacks permission for required paths.
+- Secret paths or keys were renamed without updating workflows.
+- `.env.local` content is malformed, causing the frontend container to crash after a successful deploy.
+
+### Remote host and docker‑compose issues
+
+On BEL2 and LR hosts, `docker-compose` commands and SSH connectivity are critical.
+
+Potential failures:
+
+- SSH key mismatch or revoked host access.
+- `docker-compose` not installed or not in the expected path when the remote command runs.
+- `sed` not finding or incorrectly updating the image line in `compose.yaml`.
+- `docker-compose up -d` failing because of invalid compose syntax or missing environment variables.
+
+<Callout kind="alert">
+
+When a deploy workflow fails after updating `compose.yaml` but before `docker-compose up -d` completes, the host may be left with pulled images but not running containers. Always verify container status on the host after a failed deployment.
+
+</Callout>
+
+## Operational assumptions summary
+
+<Callout kind="info">
+
+- `main` is the only branch that produces production artefacts and deployments.
+- semantic-release is the single source of truth for production version numbers via `front_vX.Y.Z` tags.
+- `registry.corp-apps.com/staging/mwp` is used only for PR validation, not for production.
+- `registry.corp-apps.com/image/mwp:${LATEST_TAG}` is the canonical image for each production deploy.
+- BEL2 and LR hosts are managed exclusively via the GitHub Actions workflows; manual changes to `/var/web/front` require coordination with platform/DevOps.
+
+</Callout>

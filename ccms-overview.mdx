@@ -1,0 +1,380 @@
+---
+title: CCMS overview
+description: Understand the CCMS architecture, boundaries, and how to use this documentation set for ownership, operations, and handover across internal teams.
+---
+
+## What the CCMS is
+
+The CCMS is a headless content platform built on WordPress Multisite and a Next.js frontend. WordPress stores content and configuration, exposes it through WPGraphQL and a custom plugin, and the Next.js app consumes that data to generate and serve pages using static generation and incremental static regeneration (ISR).
+
+Content and configuration flow from WordPress to the custom MWP plugin, then into GraphQL queries that the frontend uses to render sites and handle cache and revalidation behavior.
+
+<Callout kind="info">
+
+**Audience**
+
+- CapDev, SMO, ADS, Network, Platform, and adjacent engineering/operations teams.
+
+**Prerequisites**
+
+- Comfortable reading TypeScript/JavaScript.
+- Basic familiarity with WordPress concepts (multisite, plugins).
+- Understanding of containerized runtimes and CI/CD pipelines.
+
+</Callout>
+
+## High‑level architecture
+
+The system combines four main layers:
+
+- **WordPress Multisite instance**  
+  Manages sites, content types, taxonomies, media, and user permissions for all CCMS sites.
+
+- **Custom MWP plugin (back/mwp)**  
+  Extends WPGraphQL with CCMS‑specific types, queries, and mutations. Adds admin pages for cache control, general settings, SEO/robots/canonical configuration, on‑demand revalidation, and preview hooks.
+
+- **WPGraphQL API**  
+  Acts as the typed API boundary between WordPress and the frontend. The frontend never talks directly to the WordPress database; it uses GraphQL queries defined and extended by MWP.
+
+- **Next.js frontend (front/)**  
+  A Next.js 15 App Router application deployed in Docker, running under PM2. It fetches data via GraphQL and generates pages using static generation and ISR. It exposes revalidation and preview APIs consumed by the plugin and operational tooling.
+
+The overall flow:
+
+```mermaid
+graph LR
+  A[Editors in WordPress] --> B[MWP plugin + WPGraphQL]
+  B --> C[GraphQL API]
+  C --> D[Next.js frontend]
+  D --> E[Rendered pages (ISR/static)]
+```
+
+## Repository boundaries
+
+The repository is intentionally split into backend (WordPress) and frontend (Next.js) domains, plus shared infrastructure and automation.
+
+### Backend: back/
+
+The `back/` directory contains WordPress‑side code and configuration.
+
+Key responsibilities:
+
+- **MWP plugin (back/mwp)**  
+  - Registers custom GraphQL types and queries for:
+    - Settings and site configuration.
+    - Routing, redirects, and canonical URL resolution.
+    - SEO metadata and robots behavior.
+  - Provides admin UI pages for:
+    - Cache and general settings.
+    - On‑demand revalidation controls.
+    - Preview configuration.
+    - SEO configuration surfaces.
+  - Implements webhooks or hooks into content lifecycle to:
+    - Trigger frontend revalidation.
+    - Coordinate preview links and preview mode.
+
+- **WordPress Multisite configuration**  
+  - Handles site provisioning, mapped domains, and environment‑specific config.
+  - Integrates MWP into the standard WordPress plugin model.
+  - Defines any network‑wide settings that affect content and routing.
+
+Operationally, the backend owns content truth, editorial workflows, and the graph that the frontend consumes.
+
+### Frontend: front/
+
+The `front/` directory contains the Next.js 15 App Router frontend.
+
+Key responsibilities:
+
+- **Page rendering**  
+  - Fetches data from the WPGraphQL API.
+  - Uses static generation and ISR to:
+    - Pre‑build common routes.
+    - Revalidate pages on demand via revalidation APIs.
+  - Supports multiple site templates driven by GraphQL data.
+
+- **Runtime model**  
+  - Built and run inside a Docker container.
+  - Started under PM2 using `pm2-runtime`, which keeps the Next.js server process healthy.
+  - Uses `next.config.ts` to:
+    - Enable fetch logging.
+    - Define HTTP caching headers for responses.
+
+- **APIs for operations**  
+  - `front/app/api/revalidate/route.ts`  
+    Receives revalidation requests (typically from MWP or operational tools) and triggers ISR revalidation for specific paths or tags.
+  - `front/app/api/preview/route.ts`  
+    Enables preview mode for editors, switching from static content to draft content for specific sessions.
+
+Operationally, the frontend owns how content is delivered, cached, and revalidated, and how sites behave at runtime.
+
+### Infrastructure and CI
+
+Infrastructure and automation are organized outside `back/` and `front/`.
+
+Key responsibilities:
+
+- **Local development orchestration**  
+  - `docker-compose.yml` and `.env.sample` define local WordPress and MySQL services.
+  - Typical ports exposed include:
+    - `WORDPRESS_PORT` such as `8081` for the admin UI.
+    - `ADMINER_PORT` such as `8082` for database management.
+  - The frontend container is defined in `front/compose.yaml`, which also configures logging using JSON file logging.
+
+- **Build and deployment workflows**  
+  - `.github/workflows/` contains:
+    - Frontend build pipelines.
+    - Deployment steps to staging/production.
+    - Semantic versioning logic and tagging.
+  - Workflow steps encapsulate how code changes flow from PR to deployed artifacts.
+
+Operationally, platform and Network teams manage these layers, ensuring the runtime environment is consistent and observable.
+
+## Trust boundaries and operational assumptions
+
+The CCMS design relies on clear trust and responsibility boundaries between components and teams.
+
+### Trust boundaries
+
+- **WordPress as content authority**  
+  - WordPress Multisite is the source of truth for content, editorial metadata, routing rules, and SEO configurations.
+  - MWP is trusted to:
+    - Enforce content and routing invariants.
+    - Expose only the required data via GraphQL.
+
+- **GraphQL as the API boundary**  
+  - The frontend trusts the WPGraphQL schema as the stable contract.
+  - Direct database access from the frontend is out of scope and unsupported.
+  - Any new capabilities or data shapes must be introduced via MWP and WPGraphQL.
+
+- **Frontend as delivery boundary**  
+  - External consumers and end‑users interact only with the frontend (HTTP/HTTPS).
+  - The frontend is responsible for:
+    - Enforcing HTTP‑level security policies.
+    - Implementing caching and ISR semantics.
+    - Protecting preview and revalidation endpoints.
+
+- **CI/CD as change gate**  
+  - GitHub workflows are the enforced path for code deployment.
+  - Direct changes to production environments outside CI/CD are considered exceptional and should be documented in runbooks.
+
+### Operational assumptions
+
+These assumptions apply unless explicitly overridden in environment‑specific docs:
+
+- **Separation of concerns**  
+  - Content changes flow via WordPress; code changes flow via Git.
+  - Teams do not hot‑patch templates or plugin code through the WordPress UI.
+
+- **Environment parity**  
+  - Staging and production share:
+    - The same WordPress schema and MWP plugin version.
+    - The same Next.js major and minor versions.
+  - Differences are limited to config (domains, credentials, feature flags).
+
+- **Revalidation workflow**  
+  - Content changes do not propagate instantly on every request; they rely on:
+    - ISR revalidation policies.
+    - Explicit revalidation on publish or targeted runbook actions.
+  - Editors expect a short but non‑zero delay between publish and site update.
+
+- **Logging and observability**  
+  - Both frontend and backend surfaces log events that operations teams can correlate:
+    - Frontend fetch logging.
+    - Container logs for Next.js and WordPress.
+    - CI logs for build/deploy failures.
+
+- **Vendor independence goal**  
+  - All operational knowledge required to run, change, and debug the CCMS must be documented here such that internal teams can operate it without external vendor support.
+
+## How to use these docs
+
+Use this documentation as the canonical map of how the CCMS works and how to own your part of it. Each major topic corresponds to a dedicated page.
+
+<Callout kind="info">
+
+These topic pages are organized so that:
+
+- CapDev and SMO teams can focus on data flows, content modeling, and editor behavior.
+- ADS and Network teams can focus on runtime, failure modes, and traffic behavior.
+- Platform teams can focus on CI/CD, containerization, and environment management.
+
+</Callout>
+
+### Repository structure and ownership
+
+Start here to understand where things live in the repo and which team typically owns each area.
+
+- Layout of `back/`, `front/`, `.github/`, and infra files.
+- Team responsibilities and common touchpoints (e.g., who changes MWP vs who updates deployment workflows).
+
+<Columns cols={3}>
+
+<Card
+  title="Repository structure"
+  href="/ccms-repository-structure"
+  icon="folder"
+  cta="View repo layout"
+/>
+
+<Card
+  title="Backend plugin (MWP)"
+  href="/ccms-backend-plugin"
+  icon="database"
+  cta="Explore WordPress side"
+/>
+
+<Card
+  title="Frontend application"
+  href="/ccms-frontend-runtime"
+  icon="monitor"
+  cta="Explore frontend side"
+/>
+
+</Columns>
+
+### Content flow and data model
+
+These docs explain how content moves from editors to end‑users and how that content is structured.
+
+Use them when you need to reason about editors, GraphQL schemas, routing, and template behavior.
+
+<Columns cols={3}>
+
+<Card
+  title="Content lifecycle and flow"
+  href="/ccms-content-flow"
+  icon="book-open"
+  cta="Trace content path"
+/>
+
+<Card
+  title="GraphQL schema and data model"
+  href="/ccms-data-model"
+  icon="code"
+  cta="See types and queries"
+/>
+
+<Card
+  title="Routing, SEO, and redirects"
+  href="/ccms-routing-and-seo"
+  icon="zap"
+  cta="Understand URL rules"
+/>
+
+</Columns>
+
+### Runtime, environments, and logging
+
+Use these sections when you need to debug a live issue, validate a deployment, or understand how traffic and caching work.
+
+They focus on runtime behavior, observability, and environment differences.
+
+<Columns cols={3}>
+
+<Card
+  title="Runtime and environments"
+  href="/ccms-runtime-and-env"
+  icon="settings"
+  cta="See runtime assumptions"
+/>
+
+<Card
+  title="Logging and monitoring"
+  href="/ccms-logging-and-observability"
+  icon="terminal"
+  cta="Find and interpret logs"
+/>
+
+<Card
+  title="Failure modes and SLOs"
+  href="/ccms-failure-modes"
+  icon="alert-triangle"
+  cta="Plan for breakages"
+/>
+
+</Columns>
+
+### Security, access, and trust boundaries
+
+Reference these docs to understand which systems trust each other, where credentials live, and how to onboard new services or users safely.
+
+They are especially relevant for security reviews, audits, and incident response.
+
+<Columns cols={3}>
+
+<Card
+  title="Security model and access"
+  href="/ccms-security"
+  icon="shield"
+  cta="Review security model"
+/>
+
+<Card
+  title="Auth, secrets, and trust"
+  href="/ccms-trust-boundaries"
+  icon="lock"
+  cta="See trust boundaries"
+/>
+
+<Card
+  title="Compliance and governance"
+  href="/ccms-governance"
+  icon="users"
+  cta="Align with policies"
+/>
+
+</Columns>
+
+### Builds, releases, and runbooks
+
+These docs describe how code moves from PR to production and what to do when it does not. They also define the day‑to‑day operational procedures.
+
+Use them when planning changes, performing releases, or responding to incidents.
+
+<Columns cols={3}>
+
+<Card
+  title="Build and release pipeline"
+  href="/ccms-build-and-release"
+  icon="rocket"
+  cta="Understand CI/CD"
+/>
+
+<Card
+  title="Operational runbooks"
+  href="/ccms-runbooks"
+  icon="play-circle"
+  cta="Follow operational steps"
+/>
+
+<Card
+  title="Asset and content specs"
+  href="/ccms-asset-specs"
+  icon="package"
+  cta="Check asset rules"
+/>
+
+</Columns>
+
+## When you are taking ownership or handover
+
+When a team assumes ownership of part or all of the CCMS, use this sequence as a checklist.
+
+1. **Map your scope to the docs**  
+   - Identify which of the topic pages above match your responsibilities.
+   - Confirm who owns adjacent areas (for example, who maintains MWP vs who controls infra).
+
+2. **Validate assumptions against environments**  
+   - Compare documented environment assumptions to actual staging/production setups.
+   - Note any drift (plugin versions, Next.js versions, config flags) and schedule remediation.
+
+3. **Review failure modes and runbooks**  
+   - Walk through the main failure modes relevant to your area.
+   - Dry‑run the associated runbooks in a non‑production environment where practical.
+
+4. **Update gaps in documentation**  
+   - If you discover behavior or dependencies not captured here, update the relevant page.
+   - Treat this documentation set as part of the system; changes are code‑reviewed like any other.
+
+Using this flow ensures that ownership and handover are explicit, repeatable, and not dependent on institutional memory or external vendors.

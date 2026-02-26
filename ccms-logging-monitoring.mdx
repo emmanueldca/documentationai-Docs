@@ -1,0 +1,348 @@
+---
+title: Logging and monitoring for CCMS
+description: Understand what CCMS logs on the frontend and backend, where to find logs in each runtime, and how to monitor system health during incidents.
+---
+
+## Purpose and scope
+
+Use this page to locate logs quickly, understand what the CCMS stack emits by default, and establish basic health checks when you do not have full observability tooling.
+
+The audience is on‑call engineers and responders working on ADS, Network, and platform operations.
+
+## Frontend logging behavior
+
+Frontend logging is implemented in the `front` app using a thin wrapper around `console` and consistent error handling in API routes and page templates.
+
+### Logger wrapper and API handler errors
+
+`front/app/lib/server/logger.ts` defines a small logging utility that wraps `console.log`, `console.info`, and `console.error`. All server‑side logging in the Next app should eventually go through this wrapper.
+
+`front/app/lib/server/api/index.ts` centralizes API handler error handling:
+
+- API route handlers call into a shared helper in this module.
+- The helper catches unhandled exceptions from your handler, logs them using `logger.error(e)`, and returns an HTTP 500 JSON response.
+- The error body is generic; the full stack trace and error details remain in server logs.
+
+This gives you a consistent pattern during incident triage: for any unexpected 500 from a frontend API route, check the corresponding server logs for a `logger.error` entry around the same timestamp.
+
+### GraphQL query failures
+
+Template pages under `front/app/template1/pages/` (for example `Page.tsx`, `PostPage.tsx`, `CategoryPage.tsx`, `HomePage.tsx`) use Apollo to query WordPress data.
+
+When a GraphQL call fails:
+
+- The page catches the `ApolloError`.
+- It logs with `console.error('Error fetching ... by ID:', error)` (or similar message).
+- The component returns `null`, which the routing layer treats as `notFound()`, resulting in an HTTP 404.
+
+Operationally, this means a GraphQL outage or schema issue may show up to end users as missing pages (404), while the real failure is visible only in the server logs as a `console.error` line.
+
+### Fetch logging and cache headers
+
+`front/next.config.ts` enables fetch logging and sets cache headers for outbound `fetch` calls.
+
+Implications:
+
+- Outgoing HTTP calls made via `fetch` from server components or API routes are logged (URL and metadata).
+- Log entries provide a trace of interactions with the backend WordPress instance and any other services, including cache behavior dictated by the configured response headers.
+
+During an incident, you can reconstruct which upstreams the frontend attempted to call and whether those calls were cached or revalidated.
+
+<Callout kind="alert">
+
+CCMS does not implement structured logging, correlation IDs, or centralized log shipping by default. All logging is line‑oriented and based on raw console output from Node and `error_log` from PHP.
+
+</Callout>
+
+## Where frontend logs live
+
+Log location depends on how the frontend is running: local Node dev, Docker, or CI.
+
+### Local Node development
+
+When you run the frontend locally (for example with `npm run dev` or `next dev` in the `front` directory):
+
+- All logging produced by `front/app/lib/server/logger.ts` and `console.error` in page templates appears in your terminal session.
+- Fetch logging from `next.config.ts` also appears in the same output.
+
+<Callout kind="info">
+
+**Frontend logs in local dev**  
+Source: your shell running the Next dev server in `front`.  
+Look for `logger.error` entries, GraphQL `console.error` messages, and fetch logs around the time of a failure.
+
+</Callout>
+
+When investigating a local issue:
+
+1. Reproduce the failing request in the browser.
+2. Watch the dev server terminal for a matching error line or stack trace.
+3. Use the printed route, URL, or GraphQL query type as a key to find the same pattern in higher environments.
+
+### Docker runtime for frontend
+
+The `front/compose.yaml` file configures logging for the frontend container:
+
+- Logging driver: `json-file`
+- `max-size`: `100m`
+- `max-file`: `10`
+
+This means:
+
+- Container stdout/stderr (including Node console output, logger wrapper calls, and fetch logs) is written as JSON‑structured log lines.
+- Rotation keeps up to 10 log files, each up to 100 MB, per container.
+
+<Callout kind="info">
+
+**Frontend logs in Docker**  
+Source: Docker engine on the host that runs the `front` container (see `front/compose.yaml`).  
+Access using `docker logs <front-container-name>` or by reading JSON log files from the Docker runtime directory on the host.
+
+</Callout>
+
+In typical deployments that reuse this compose configuration, `docker logs` is your primary mechanism for retrieving frontend logs unless the host forwards Docker logs to an external system.
+
+### CI (GitHub Actions) logs
+
+In CI, the frontend application is usually built and tested inside a GitHub Actions workflow:
+
+- The Node process writes logs to stdout/stderr.
+- GitHub Actions captures this output and displays it in the workflow logs UI.
+- Any failing test that triggers API handlers, page rendering, or GraphQL queries will log errors and stack traces the same way as in local dev or Docker.
+
+<Callout kind="info">
+
+**Frontend logs in CI**  
+Source: GitHub Actions workflow runs that build/test the `front` app.  
+Access from the GitHub UI by opening the relevant workflow run and inspecting step logs for build, test, or integration phases.
+
+</Callout>
+
+When debugging a test failure that only appears in CI, compare timestamps and error messages from GitHub logs to those seen locally or in staging to confirm whether it is environment‑specific.
+
+## Backend and plugin logging
+
+The backend WordPress plugin under `back/mwp` includes lightweight helpers for debugging and error logging.
+
+### Plugin logging helpers
+
+`back/mwp/mwp.php` defines two utility functions:
+
+- `vw_log(...)`  
+  - Wraps `error_log(print_r(args, true))`.  
+  - Accepts one or more arguments, serializes them, and sends them to the PHP error log.
+- `vw_dump(...)`  
+  - Prints arguments directly into the HTML response for quick debugging while developing.
+
+Recommended operational usage:
+
+- Use `vw_log` for any server‑side events you may need during incident analysis: cache invalidation events, GraphQL query construction, revalidation triggers, or WordPress hook execution.
+- Avoid `vw_dump` in shared or production environments because it leaks internal state into responses and can interfere with JSON APIs.
+
+### WordPress error logging configuration
+
+WordPress error logging itself is controlled through `wp-config.php` rather than this repository:
+
+- `WP_DEBUG`, `WP_DEBUG_LOG`, and `WP_DEBUG_DISPLAY` determine whether PHP errors and `error_log` output are logged to files or displayed.
+- The CCMS plugin does not override these constants; it relies on the host WordPress configuration.
+
+<Callout kind="alert">
+
+Backend logging behavior depends on the WordPress host configuration (`wp-config.php`). If `WP_DEBUG_LOG` is disabled, calls to `vw_log` may not persist anywhere beyond the web server error log.
+
+</Callout>
+
+### Where backend logs are stored
+
+Backend log storage varies by environment. The repository includes Docker configuration for local usage; production typically relies on the hosting platform.
+
+#### Local Docker
+
+Local Docker setups using `docker-compose.yml` run WordPress and the CCMS plugin inside containers:
+
+- PHP `error_log` output is captured by the web server (e.g., Apache or Nginx with PHP‑FPM).
+- Docker then captures the container stdout/stderr as logs, similar to the frontend.
+
+<Callout kind="info">
+
+**Backend logs in local Docker**  
+Source: WordPress/PHP container started by `docker-compose.yml`.  
+Access using `docker logs <wordpress-container-name>` or by inspecting the container filesystem for the PHP error log (commonly `/var/log/apache2/error.log` or equivalent).
+
+</Callout>
+
+Any calls to `vw_log` will show up alongside native PHP warnings and WordPress errors in these logs.
+
+#### Typical higher‑environment deployments
+
+In staging and production, WordPress is commonly hosted on a managed platform or standard LAMP stack:
+
+- PHP error logs may be:
+  - Written to local files (for example `/var/log/php/error.log` or virtual host logs).
+  - Captured by a hosting control panel (cPanel, Plesk, or provider‑specific UI).
+  - Forwarded to a centralized logging platform via syslog, filebeat, or equivalent.
+- The CCMS plugin does not change this behavior; `vw_log` and `error_log` entries appear wherever the host sends all PHP logs.
+
+Coordinate with the platform or hosting team to verify the exact path and retention policy.
+
+## Minimal monitoring signals for system health
+
+Even without APM or full metrics, you can maintain a basic view of CCMS health using HTTP‑level checks and targeted validation of key flows.
+
+### HTTP endpoints to check
+
+At minimum, establish periodic checks (synthetic probes or external monitoring) for:
+
+- **Frontend HTTP checks**
+  - A representative published page (e.g., the home page and one category or article page).
+  - Expect: HTTP 200, correct HTML shell, no persistent 500/404 for known content.
+
+- **GraphQL checks**
+  - A simple read‑only GraphQL query executed via the WordPress endpoint that CCMS uses.
+  - Expect: HTTP 200 and a data payload with expected schema fields; no repeated timeouts or GraphQL errors.
+
+- **Revalidation endpoint checks**
+  - The frontend exposes revalidation or cache invalidation routes (for example Next revalidation API routes) that receive callbacks from WordPress or other systems.
+  - Expect: HTTP 200 or 204 for a known test revalidation request and a follow‑up page load with updated content after a controlled change.
+
+Use these checks as early warning indicators even if no application‑level metrics are available.
+
+### Interpreting failures
+
+If any of the basic checks fail:
+
+- **Frontend page check fails**
+  - 500 status: likely a Next server or API handler issue; inspect frontend logs around that time.
+  - 404 for a page that should exist: investigate GraphQL failures (template pages log `console.error` and silently convert to 404).
+
+- **GraphQL check fails**
+  - Errors in the response: check backend logs for PHP or GraphQL errors and confirm that the CCMS plugin is active and configured.
+  - Timeouts or 5xx: likely a hosting or network issue; correlate with both frontend fetch logs and backend PHP logs.
+
+- **Revalidation check fails**
+  - Revalidation endpoint returns 4xx or 5xx: inspect frontend API logs.
+  - Endpoint succeeds but content does not update: check backend plugin logs (`vw_log` around revalidation hooks) and cache behavior.
+
+## Correlating frontend and backend activity
+
+When investigating an incident, you often need to trace a single user action across the frontend and WordPress backend.
+
+### Useful correlation points
+
+Use the following shared signals to stitch together logs from both sides:
+
+- **Timestamps**
+  - Compare the time a browser request occurred (from user report or monitoring) with log timestamps from Node and PHP.
+  - Align on a single time zone when possible; if not, account for offset when correlating.
+
+- **Routes and URLs**
+  - Frontend logs include route paths (`/`, `/category/...`, `/post/...`) and API route URLs.
+  - Backend logs often include the requested URL or GraphQL endpoint path.
+  - Match the route or slug between the systems to identify the same request.
+
+- **GraphQL query names and context**
+  - Template pages log messages like `Error fetching <entity> by ID` when GraphQL fails.
+  - Backend GraphQL handlers or WordPress plugins may log the query name, type, or associated post ID using `vw_log`.
+  - Use the entity type and ID as a join key across logs.
+
+- **Revalidation and webhook events**
+  - Revalidation endpoints on the frontend receive callbacks from the backend or external systems.
+  - Log both the incoming revalidation HTTP request on the frontend and the emission of the revalidation event in the backend plugin using `vw_log`.
+  - For a specific content change, trace: content edit → backend hook → revalidation call → frontend cache update → page fetch.
+
+### Practical correlation workflow
+
+During an incident:
+
+1. Identify the affected route or content (URL, post ID, or category).
+2. Gather timestamps for when users observed the issue.
+3. Pull frontend logs around that window (Node/Docker/CI).
+4. Pull backend WordPress/PHP logs for the same time window.
+5. Search for:
+   - Matching routes or slugs.
+   - GraphQL errors mentioning the content type or ID.
+   - `vw_log` entries tied to revalidation or GraphQL operations.
+
+Use these overlapping features to reconstruct the full path even without distributed tracing.
+
+## Incident triage checklist
+
+Use this checklist as a starting point when CCMS content appears broken, missing, or slow.
+
+<Steps>
+
+<Step title="Confirm impact and basic health" icon="alert-triangle">
+
+- Load the home page and at least one known article or category page.
+- Run or trigger your standard HTTP checks for frontend pages, GraphQL, and revalidation endpoints.
+- Note which checks fail (status codes, errors, or timeouts) and when.
+
+</Step>
+
+<Step title="Check frontend logs for recent errors" icon="terminal">
+
+- For the affected environment, collect frontend logs:
+  - Local: inspect the dev server terminal.
+  - Docker: run `docker logs` for the `front` container.
+  - CI: open the relevant GitHub Actions run logs.
+- Look for:
+  - API handler errors logged via `logger.error`.
+  - GraphQL `console.error` messages that correspond to 404s.
+  - Fetch logs showing failed calls to backend or third‑party services.
+
+</Step>
+
+<Step title="Inspect backend WordPress and plugin logs" icon="database">
+
+- Access PHP/WordPress logs from the appropriate host or container.
+- Search for:
+  - PHP warnings or fatal errors around the incident time.
+  - Entries produced by `vw_log`, especially those related to GraphQL and revalidation hooks.
+- Confirm that WordPress is reachable and responding to GraphQL queries.
+
+</Step>
+
+<Step title="Correlate frontend and backend timelines" icon="clock">
+
+- Align logs by timestamp to connect:
+  - User or synthetic checks → frontend route logs → backend GraphQL or PHP errors.
+- Use route paths, post IDs, or GraphQL operation names appearing in both log sets as correlation keys.
+- Determine whether the failure originates in the frontend render, an upstream call, or WordPress itself.
+
+</Step>
+
+<Step title="Validate revalidation and cache behavior" icon="refresh-ccw">
+
+- If content is stale or missing, trigger a controlled change to a test page.
+- Confirm:
+  - Backend logs a revalidation‑related `vw_log` entry.
+  - Frontend receives and handles the revalidation endpoint call successfully.
+  - The test page reflects updated content after cache invalidation.
+- If any step fails, focus remediation on the broken link in this chain.
+
+</Step>
+
+<Step title="Capture findings and add targeted logging" icon="edit">
+
+- Once you identify the failing component, add or refine logging:
+  - Frontend: extend usage of the logger wrapper in key API routes or template paths.
+  - Backend: add `vw_log` around critical hooks and GraphQL interactions (while respecting privacy and log volume).
+- Document the observed error patterns and their resolution for future on‑call rotations.
+
+</Step>
+
+</Steps>
+
+## Known limitations and next steps
+
+<Callout kind="alert">
+
+Current CCMS deployments typically lack centralized logging, structured log formats, and end‑to‑end tracing. Log access and retention vary by environment and hosting provider, and there is no built‑in correlation ID propagation between frontend and backend.
+
+</Callout>
+
+To improve operability over time:
+
+- Standardize WordPress `wp-config.php` logging settings across environments.
+- Adopt a log aggregation solution that ingests both Docker logs (frontend) and PHP error logs (backend).
+- Introduce minimally structured log fields (such as request IDs, route names, and content IDs) in `logger` and `vw_log` calls to make correlation faster.

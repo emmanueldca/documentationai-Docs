@@ -1,0 +1,518 @@
+---
+title: CCMS security and access model
+description: Understand how CCMS secures WordPress multisite access, GraphQL, operational endpoints, and secrets across environments and trust boundaries.
+---
+
+## Security model overview
+
+CCMS relies on WordPress multisite for content authority, a server-side GraphQL layer for data access, and a Next-based frontend for delivery. Security depends on keeping secrets server-side, constraining who can publish through WordPress, and tightly controlling operational endpoints.
+
+<Callout kind="info">
+
+This page focuses on CCMS-specific behavior. Combine it with your existing WordPress hardening, network security, and identity practices.
+
+</Callout>
+
+## Access control layers
+
+Three main access layers govern who can change content and configuration:
+
+- WordPress multisite roles and capabilities
+- Server-side GraphQL authentication
+- Protected frontend operational endpoints
+
+### WordPress multisite access controls
+
+WordPress remains the source of truth for content and editorial authority. CCMS assumes you run in a multisite configuration.
+
+#### Network admin vs site admin
+
+- **Network Admin (super admin)**  
+  Controls the entire multisite network, including:
+
+  - Creating and deleting sites
+  - Installing and updating plugins and themes
+  - Managing network-wide settings, including CCMS plugin options that affect all sites
+
+- **Site Admin (per-site administrator)**  
+  Controls a single site within the network:
+
+  - Managing users and roles on that site
+  - Configuring site-level settings (including CCMS plugin settings scoped to that site)
+  - Publishing and managing content that appears on the frontend
+
+<Callout kind="alert">
+
+Limit Network Admin accounts to a very small group. Misconfiguration at the network level can affect all CCMS properties and security settings.
+
+</Callout>
+
+#### Editorial roles and publishing
+
+CCMS does not change core WordPress editorial roles, but it relies on them as the gatekeeper for what appears on the frontend.
+
+Common patterns:
+
+- **Editor**: Approves and publishes content that CCMS later exposes via GraphQL.
+- **Author / Contributor**: Creates content which may require review before publishing.
+- **Custom roles**: Many organizations add more granular roles (for example, localized editors, legal reviewers). CCMS respects any capability-based workflow you implement.
+
+Publishing in WordPress is the point where content becomes eligible for public delivery through the frontend. Draft and preview access are explicitly handled via the `/api/preview` endpoint.
+
+## GraphQL access and authentication
+
+The CCMS frontend talks to WordPress via a server-side GraphQL client defined in `front/app/lib/server/graphql/apollo.ts`. That client authenticates each request using HTTP Basic Auth.
+
+### Server-side Basic Auth
+
+The GraphQL `HttpLink` is configured roughly as follows:
+
+```ts
+// Pseudocode adapted from front/app/lib/server/graphql/apollo.ts
+
+const authHeader = Buffer.from(
+  `${process.env.WP_USER}:${process.env.WP_PASSWORD}`
+).toString("base64")
+
+const client = new ApolloClient({
+  link: new HttpLink({
+    uri: process.env.WP_ENDPOINT,
+    headers: {
+      Authorization: `Basic ${authHeader}`,
+    },
+    // ...
+  }),
+  // ...
+})
+```
+
+Key properties of this setup:
+
+- **Basic Auth credentials are secrets**  
+  - `WP_USER` and `WP_PASSWORD` identify an account that has access to GraphQL content.
+  - These values must never appear in any `NEXT_PUBLIC_` environment variable or client-side bundle.
+
+- **GraphQL requests run server-side only**  
+  - The code in `front/app/lib/server/graphql/apollo.ts` executes in a server context.
+  - Visitors never see these credentials; they only see rendered HTML/JSON produced by server-side code.
+
+- **WordPress authority is enforced at GraphQL**  
+  - The GraphQL endpoint enforces whatever WordPress capabilities the `WP_USER` account has.
+  - Use the least-privileged account that still supports your content needs.
+
+<Callout kind="alert">
+
+Never expose `WP_USER`, `WP_PASSWORD`, or `WP_ENDPOINT` to the browser, logs, analytics tools, or client-side error messages. Treat them as production secrets.
+
+</Callout>
+
+## Protected operational endpoints
+
+The frontend provides operational endpoints for revalidation and preview. Both are protected using secrets so only authorized systems and links can trigger them.
+
+### `/api/revalidate`: cache invalidation
+
+The `/api/revalidate` endpoint is responsible for triggering revalidation of static content. It validates an Authorization header before performing any operation.
+
+Protection behavior:
+
+- The handler checks:
+
+  ```text
+  Authorization: Bearer <secret>
+  ```
+
+- The secret must match:
+
+  ```text
+  Bearer ${process.env.WP_REVALIDATE_SECRET_KEY}
+  ```
+
+- If the header is missing or incorrect, the endpoint returns an error and does not revalidate.
+
+On the WordPress side, the CCMS plugin reads the revalidation configuration from options using `back/mwp/src/Revalidation.php`:
+
+- The plugin reads:
+
+  - `mwp_odr_settings.frontend_url` to know where to send the request.
+  - `mwp_odr_settings.revalidate_secret_key` to construct the Authorization header.
+
+- The plugin then calls the frontend `/api/revalidate` endpoint using that URL and secret.
+
+<Callout kind="alert">
+
+`WP_REVALIDATE_SECRET_KEY` and the `mwp_odr_settings.revalidate_secret_key` option must always match. If they drift, WordPress will not be able to trigger cache revalidation, which can lead to stale or missing content.
+
+</Callout>
+
+### `/api/preview`: draft and preview access
+
+The `/api/preview` endpoint enables preview mode for unpublished or draft content. It uses a shared secret and content identifiers.
+
+Protection behavior:
+
+- The handler expects:
+
+  - A query parameter `secret` equal to `process.env.WP_PREVIEW_SECRET_KEY`.
+  - Query parameters `id` and `type` that identify the content to preview.
+
+- The logic is:
+
+  - If `secret` does not match `WP_PREVIEW_SECRET_KEY`, the request fails.
+  - If `id` or `type` are missing, it does not enable preview mode.
+  - When all checks pass, it enables draft mode and redirects to an internal preview route.
+
+Preview links must therefore include all three parameters:
+
+```text
+/api/preview?secret=<WP_PREVIEW_SECRET_KEY>&id=<content-id>&type=<content-type>
+```
+
+Because `secret` is in the URL, restrict where preview links can be used:
+
+- Use them only in authenticated WordPress admin contexts or internal tools.
+- Avoid embedding them in emails or public channels without additional access controls.
+
+<Callout kind="alert">
+
+Treat preview URLs as sensitive. Anyone with the full URL (including `secret`) can see drafts of that specific resource until you rotate the preview secret.
+
+</Callout>
+
+## Secrets and configuration
+
+CCMS uses a mix of environment variables on the frontend and stored options in the WordPress database. Understanding where each secret lives helps you manage rotation and environment parity.
+
+### Core secrets and their locations
+
+Use `<Tabs>` to see how access control, secrets, and trust boundaries relate.
+
+<Tabs>
+
+<Tab title="Access control" icon="lock">
+
+WordPress roles and Basic Auth credentials jointly control who can change content and who can read it via GraphQL.
+
+- **WordPress roles**  
+  Network admins and site admins manage roles and capabilities that determine who can publish content and change CCMS plugin settings.
+
+- **GraphQL account (`WP_USER` / `WP_PASSWORD`)**  
+  The account used by the frontend to call `WP_ENDPOINT`. Keep this account:
+
+  - Scoped to the minimum capabilities needed for CCMS.
+  - Distinct from any human admin account.
+  - Rotated using a defined process (see rotation steps below).
+
+- **Operational endpoints**  
+  Access to `/api/revalidate` and `/api/preview` is separate from editor logins:
+
+  - `/api/revalidate` is typically called by the CCMS plugin, not by humans.
+  - `/api/preview` is typically triggered by WordPress-generated links in the admin UI.
+
+</Tab>
+
+<Tab title="Secrets" icon="shield">
+
+At a high level, secrets fall into two groups: environment variables on the frontend, and options stored in WordPress.
+
+- **Frontend environment variables (server-side)**
+
+  - `WP_USER` and `WP_PASSWORD`  
+    Basic Auth credentials for GraphQL requests from `front/app/lib/server/graphql/apollo.ts`.
+
+  - `WP_ENDPOINT`  
+    URL of the WordPress GraphQL endpoint. Not strictly a secret but should not be exposed unnecessarily.
+
+  - `WP_REVALIDATE_SECRET_KEY`  
+    Shared secret expected by `/api/revalidate` in the `Authorization` header.
+
+  - `WP_PREVIEW_SECRET_KEY`  
+    Shared secret expected by `/api/preview` as a `secret` query parameter.
+
+- **WordPress options (stored in CCMS plugin settings)**
+
+  - `mwp_odr_settings.frontend_url`  
+    The base URL of the frontend used by the plugin to call `/api/revalidate`.
+
+  - `mwp_odr_settings.revalidate_secret_key`  
+    The secret used by `back/mwp/src/Revalidation.php` to construct the Authorization header for frontend revalidation calls.
+
+- **Rotation considerations**
+
+  - Rotate environment variables and WordPress options together so shared secrets stay in sync.
+  - Coordinate rotation across all environments (local, staging, production) to avoid cross-environment calls with mismatched secrets.
+
+</Tab>
+
+<Tab title="Trust boundaries" icon="shield">
+
+CCMS has three primary trust boundaries:
+
+- **WordPress backend (origin and authority)**
+
+  - Stores canonical content and editorial history.
+  - Runs the CCMS plugin, which knows the `frontend_url` and `revalidate_secret_key`.
+  - Requires strong authentication and role hygiene.
+
+- **GraphQL boundary**
+
+  - Exposes selected WordPress data to the frontend.
+  - Protected by Basic Auth using `WP_USER` and `WP_PASSWORD`.
+  - Any compromise here can reveal content accessible to that account, even if it is not yet published.
+
+- **Frontend public boundary**
+
+  - Receives traffic from anonymous users.
+  - Hosts `/api/revalidate` and `/api/preview`, which rely on secrets rather than user identity.
+  - Must never leak secrets via logs, error messages, or client-side bundles.
+
+</Tab>
+
+</Tabs>
+
+## Safe secret rotation checklist
+
+Use this sequence whenever you rotate GraphQL credentials or operational secrets. Adjust timing to your deployment strategy, but maintain the order to avoid outages.
+
+<Steps>
+
+<Step title="Plan the rotation window" icon="settings">
+
+- Identify which secrets you are rotating:
+
+  - GraphQL account: `WP_USER`, `WP_PASSWORD`
+  - Revalidation: `WP_REVALIDATE_SECRET_KEY` and `mwp_odr_settings.revalidate_secret_key`
+  - Preview: `WP_PREVIEW_SECRET_KEY` and any stored preview URLs
+
+- Choose a low-traffic window and ensure you have access to:
+
+  - WordPress Network Admin and relevant Site Admins
+  - Frontend environment configuration and deployment pipeline
+
+</Step>
+
+<Step title="Update WordPress-side configuration" icon="edit">
+
+- For **GraphQL credentials**:
+
+  - Create or update the dedicated WordPress user that `WP_USER` represents.
+  - Adjust its capabilities to match the intended access scope.
+
+- For **revalidation secret**:
+
+  - In the CCMS plugin settings page, update `mwp_odr_settings.revalidate_secret_key` to the new value.
+  - Confirm `mwp_odr_settings.frontend_url` still points to the correct frontend environment.
+
+- For **preview**:
+
+  - Decide whether you will change `WP_PREVIEW_SECRET_KEY`. If you do, be aware that old preview links stop working.
+
+</Step>
+
+<Step title="Update frontend environment variables" icon="terminal">
+
+- In your frontend environment configuration:
+
+  - Set `WP_USER` and `WP_PASSWORD` to match the new GraphQL account.
+  - Set `WP_REVALIDATE_SECRET_KEY` to the same value as `mwp_odr_settings.revalidate_secret_key`.
+  - Set `WP_PREVIEW_SECRET_KEY` to the new preview secret if you changed it.
+
+- Trigger a deployment or restart so the runtime picks up the updated environment variables.
+
+Success signals:
+
+- Application boots successfully with new env vars.
+- No authentication errors appear when calling GraphQL or operational endpoints from normal flows.
+
+</Step>
+
+<Step title="Verify GraphQL and content delivery" icon="check-circle">
+
+- Trigger a page that loads content via GraphQL:
+
+  - Confirm content renders as expected.
+  - Check server logs for failed Basic Auth or GraphQL errors.
+
+- If you maintain health checks or synthetic tests, verify they pass after rotation.
+
+If anything fails, roll back the changed env vars and WordPress settings to the previous known-good state while you investigate.
+
+</Step>
+
+<Step title="Verify revalidation and preview endpoints" icon="play-circle">
+
+- From WordPress, perform an action that should trigger revalidation (for example, editing and updating a page):
+
+  - Confirm that `/api/revalidate` is called with `Authorization: Bearer ${WP_REVALIDATE_SECRET_KEY}`.
+  - Verify that the updated content appears on the frontend without manual intervention.
+
+- From the WordPress admin UI, open a preview link:
+
+  - Ensure the preview URL includes `secret`, `id`, and `type`.
+  - Confirm that `/api/preview` accepts the request, enables draft mode, and redirects correctly.
+
+</Step>
+
+<Step title="Clean up and document" icon="trash">
+
+- Ensure old secrets are:
+
+  - Removed from environment configurations.
+  - Not present in WordPress options or plugin settings.
+  - Not stored in plaintext docs or ticket systems.
+
+- Update your internal documentation to record:
+
+  - When rotation occurred.
+  - Which secrets were changed.
+  - Any follow-up actions or lessons learned.
+
+</Step>
+
+</Steps>
+
+## Trust boundaries and operational constraints
+
+Understanding current limitations helps you design monitoring and incident response around CCMS.
+
+### Trust boundary implications
+
+- **WordPress as the source of truth**
+
+  - All role-based access control lives in WordPress.
+  - If WordPress is compromised, an attacker can:
+
+    - Change content that CCMS will publish.
+    - Modify plugin settings such as `frontend_url` and `revalidate_secret_key`.
+    - Indirectly affect what the frontend serves.
+
+- **GraphQL boundary exposure**
+
+  - Basic Auth depends on the secrecy of `WP_USER` and `WP_PASSWORD`.
+  - If those credentials leak:
+
+    - An attacker can call `WP_ENDPOINT` directly.
+    - They gain access to whatever the account can read, which may include drafts or otherwise hidden content.
+
+- **Frontend as public boundary**
+
+  - `/api/revalidate` and `/api/preview` trust secrets rather than user identity.
+  - If `WP_REVALIDATE_SECRET_KEY` leaks:
+
+    - An attacker can cause arbitrary revalidation churn and potentially leverage it in denial-of-service patterns.
+
+  - If `WP_PREVIEW_SECRET_KEY` leaks:
+
+    - Anyone with a valid `id` and `type` can see specific draft content via preview links.
+
+<Callout kind="alert">
+
+Treat all shared secrets (`WP_USER`, `WP_PASSWORD`, `WP_REVALIDATE_SECRET_KEY`, `WP_PREVIEW_SECRET_KEY`, and `mwp_odr_settings.revalidate_secret_key`) as equally sensitive. Protect them with the same rigor as database credentials.
+
+</Callout>
+
+### Known limitations and constraints
+
+Be aware of the following constraints when designing observability and security controls.
+
+#### Lack of correlation IDs
+
+- Current code paths do not attach a correlation ID that flows:
+
+  - From WordPress plugin calls
+  - Through `/api/revalidate` or `/api/preview`
+  - Into GraphQL requests and frontend rendering
+
+- This makes it harder to:
+
+  - Trace a single content change from authoring to publication.
+  - Tie operational logs together across systems during incident response.
+
+Mitigation:
+
+- Add your own request IDs at the edge (for example, in load balancers or reverse proxies).
+- Use log sampling and structured logging to reconstruct flows when needed.
+
+#### Reliance on Basic Auth for GraphQL
+
+- The GraphQL link uses HTTP Basic Auth with static credentials.
+- This has several security considerations:
+
+  - Credentials are long-lived unless you rotate them.
+  - There is no built-in notion of per-request identity or audit trail for frontend GraphQL calls.
+  - Credential compromise gives broad read access consistent with that account.
+
+Mitigation:
+
+- Use a dedicated WordPress user with minimal permissions for `WP_USER`.
+- Rotate `WP_USER` and `WP_PASSWORD` on a defined schedule.
+- Restrict network access to `WP_ENDPOINT` where possible (for example, via VPN or internal-only networking).
+
+#### Preview link security constraints
+
+- Preview URLs contain the `secret` directly in the query string.
+- Links may be:
+
+  - Logged by intermediate systems (browsers, proxies, analytics tools).
+  - Shared beyond intended recipients if not handled carefully.
+
+Mitigation:
+
+- Limit the lifetime of `WP_PREVIEW_SECRET_KEY` when feasible.
+- Restrict where preview links can be generated and shared (for example, internal-only environments).
+- Consider additional controls in front of `/api/preview` (IP allowlists, VPN access) for sensitive environments.
+
+#### Environmental drift
+
+- Secrets and settings are stored in two places:
+
+  - Frontend environment variables
+  - WordPress options (`mwp_odr_settings.*`)
+
+- Over time, these can drift across environments:
+
+  - Production WordPress may point to staging frontend via `frontend_url`.
+  - `mwp_odr_settings.revalidate_secret_key` may not match `WP_REVALIDATE_SECRET_KEY`.
+  - Different environments may inadvertently share secrets.
+
+Mitigation:
+
+- Treat WordPress options as configuration that belongs in your infrastructure-as-code or configuration management process where possible.
+- Maintain a mapping of:
+
+  - Each environment (local, staging, production)
+  - Its `frontend_url`
+  - Its revalidation and preview secrets
+
+- Include drift checks in your deployment and change-review process.
+
+---
+
+## Next steps
+
+Deepen your understanding of how this security model connects to runtime behavior and deployment:
+
+<Columns cols={3}>
+
+<Card
+  title="CCMS overview"
+  href="/ccms-overview"
+  icon="book-open"
+  cta="Review architecture"
+/>
+
+<Card
+  title="Frontend runtime environments"
+  href="/ccms-runtime-environments"
+  icon="monitor"
+  cta="Map environments"
+/>
+
+<Card
+  title="Backend CCMS plugin"
+  href="/ccms-backend-mwp-plugin"
+  icon="database"
+  cta="Inspect WP settings"
+/>
+
+</Columns>

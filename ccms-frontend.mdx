@@ -1,0 +1,551 @@
+---
+title: CCMS frontend architecture and development guide
+description: Understand the CCMS Next.js frontend architecture, configuration, environment, data flow, and safe extension patterns for frontend and full‑stack engineers.
+---
+
+## Architecture overview
+
+The CCMS frontend is a Next.js 15 application that renders the site from a WordPress GraphQL backend, packaged for deployment via Docker and PM2.
+
+The app uses the App Router with a catch‑all route under `front/app/[[...route]]` to serve most paths. Template‑specific folders under `front/app` define layout and behavior for different page types and are composed into this catch‑all route.
+
+At runtime the container runs the production build with `pm2-runtime`, listening on `PORT` (default `3000`). Local development defaults to Next.js dev mode on port `3003`.
+
+<Callout kind="info">
+
+This guide focuses on how the frontend is wired to the WordPress GraphQL backend, how routing and revalidation work, and where to extend the system safely without breaking existing behavior.
+
+</Callout>
+
+### Core routing and templates
+
+The routing layer is built on the App Router with a single catch‑all entry point:
+
+- `front/app/[[...route]]` handles the majority of incoming paths.
+- Template‑specific folders live alongside this catch‑all route (for example, home, category, post templates) and are composed inside it.
+- The routing logic maps incoming paths to the correct template and GraphQL query based on WordPress data (this mapping is inferred from the folder layout; exact mapping logic lives in the catch‑all route and template code).
+
+<Callout kind="alert">
+
+The catch‑all route under `front/app/[[...route]]` is a sensitive area. Changes to its logic affect every page in the site. Treat edits there as global routing changes and review them with extra care.
+
+</Callout>
+
+### Operational endpoints
+
+Two operational endpoints live under `front/app/api`:
+
+- `front/app/api/revalidate/route.ts` — performs Incremental Static Regeneration (ISR) revalidation.
+- `front/app/api/preview/route.ts` — toggles preview mode for unpublished or draft content.
+
+Both endpoints integrate with Next.js caching and revalidation. They are used when content changes in WordPress so the frontend can refresh static pages.
+
+<Callout kind="alert">
+
+Changes to `revalidate` and `preview` routes can break content updates or preview flows for editors. Avoid renaming these routes or changing their signatures unless you also update all callers and deployment wiring.
+
+</Callout>
+
+### Build and runtime model
+
+The frontend build and runtime behavior are defined by:
+
+- `front/next.config.ts`
+- `front/Dockerfile`
+- `front/compose.yaml`
+- `front/package.json`
+
+At a high level:
+
+- `next.config.ts` configures caching headers for static assets and enables fetch logging. ISR is configured using constants from `front/app/lib/constants.ts`.
+- `Dockerfile` builds the production app, then runs it via `pm2-runtime`, exposing `PORT` (default `3000`).
+- `compose.yaml` runs the container for local use, maps host port `3000` to container port `3000`, and loads environment from `.env.local`.
+- `package.json` defines local dev scripts such as `next dev -p 3003`, `build`, `start`, and `lint`.
+
+## Configuration files
+
+This section summarizes the main configuration files you will touch as a frontend or full‑stack engineer.
+
+### next.config.ts
+
+`front/next.config.ts` controls framework‑level behavior:
+
+- Sets caching headers for static assets and pages.
+- Enables fetch logging for debugging backend calls.
+- Integrates with ISR via `NEXT_PUBLIC_REVALIDATE_STATIC` (from `front/app/lib/constants.ts`).
+
+The file does not introduce external services beyond what Next.js uses internally. When you change cache headers or revalidation intervals here, verify that they still align with WordPress content update patterns.
+
+### Dockerfile
+
+`front/Dockerfile` describes the production container image:
+
+- Installs dependencies and builds the Next.js app.
+- Uses `pm2-runtime` as the process manager.
+- Exposes `PORT` (default `3000`) for HTTP traffic.
+
+This model ensures a single long‑running process per container and supports graceful restarts. Any change to the `CMD` or `ENTRYPOINT` in this file should be validated in both local Docker and your deployment environment.
+
+### compose.yaml
+
+`front/compose.yaml` orchestrates local container runs:
+
+- Maps `3000:3000` (host:container) so the app is reachable at `http://localhost:3000`.
+- Loads environment variables from `.env.local`.
+- Configures container logging using the `json-file` driver.
+
+Use this file when you want to mimic the production container experience during local development.
+
+### package.json scripts
+
+`front/package.json` includes common scripts for development and CI:
+
+- `dev`: runs `next dev -p 3003` for local development.
+- `build`: builds the app for production.
+- `start`: runs the production server.
+- `lint`: runs static checks.
+
+The `dev` script using port `3003` avoids clashing with Docker‑based runs, which expose port `3000`.
+
+## Environment variables
+
+The frontend relies on several environment variables for runtime configuration. All of these must be defined either in `.env.local` for local development or in your deployment environment.
+
+<Callout kind="info">
+
+Do not commit real credentials to the repo. Use environment‑specific secrets management for production values and `.env.local` (git‑ignored) for local values.
+
+</Callout>
+
+### Backend connectivity and authentication
+
+<ParamField body="WP_ENDPOINT" param-type="string" required="true" show-location="false">
+
+Full URL of the WordPress GraphQL endpoint used by the Apollo client, for example `https://cms.acme.test/graphql`.
+
+</ParamField>
+
+<ParamField body="WP_USER" param-type="string" required="true" show-location="false">
+
+WordPress username used for authenticated GraphQL access if the backend requires basic auth or similar.
+
+</ParamField>
+
+<ParamField body="WP_PASSWORD" param-type="string" required="true" show-location="false">
+
+WordPress password paired with `WP_USER` for authenticated GraphQL access.
+
+</ParamField>
+
+### Site and asset configuration
+
+<ParamField body="SITE_URL" param-type="string" required="true" show-location="false">
+
+Canonical base URL of the frontend site, for example `https://www.acme.test`. Used where the app needs to construct absolute URLs.
+
+</ParamField>
+
+<ParamField body="NEXT_PUBLIC_IMG_HOSTNAME" param-type="string" required="true" show-location="false">
+
+Hostname that the Next.js image component is allowed to load remote images from, for example `images.acme.test` or `cms.acme.test`.
+
+</ParamField>
+
+### Static generation and pagination
+
+These values are defined (with defaults) in `front/app/lib/constants.ts` and then used across the app.
+
+<ParamField body="NEXT_PUBLIC_REVALIDATE_STATIC" param-type="number" required="false" show-location="false">
+
+ISR revalidation interval in seconds for static pages. The default in constants is `300` seconds if not explicitly set.
+
+</ParamField>
+
+<ParamField body="NEXT_PUBLIC_CATEGORY_PAGE_SIZE" param-type="number" required="false" show-location="false">
+
+Default page size for category listing pages. Used when querying posts for a category and paginating results.
+
+</ParamField>
+
+<ParamField body="NEXT_PUBLIC_POST_PAGE_SIZE" param-type="number" required="false" show-location="false">
+
+Default page size for post listings (for example, archive views or search results) where a generic post pagination size is needed.
+
+</ParamField>
+
+### Runtime port
+
+<ParamField body="PORT" param-type="number" required="false" show-location="false">
+
+Port the Next.js server listens on in production and Docker runs. Defaults to `3000` if not set.
+
+</ParamField>
+
+## Local development setup
+
+Use this section to get a fully working local environment connected to your WordPress GraphQL backend.
+
+<Callout kind="info">
+
+Assumptions:
+
+- You have Node.js and npm available for direct dev runs.
+- You have Docker and Docker Compose installed for container runs.
+- You have access to a WordPress instance with the GraphQL endpoint enabled.
+
+</Callout>
+
+### Step‑by‑step setup
+
+<Steps>
+
+<Step title="Prepare backend access" icon="database">
+
+- Ensure your WordPress instance exposes a GraphQL endpoint, for example `https://cms.acme.local/graphql`.
+- Create or confirm credentials (`WP_USER`, `WP_PASSWORD`) that have permission to query the content you need.
+
+</Step>
+
+<Step title="Configure local environment" icon="settings">
+
+- In `front/.env.local`, define all required environment variables:
+
+  ```bash
+  # WordPress GraphQL
+  WP_ENDPOINT="https://cms.acme.local/graphql"
+  WP_USER="frontend_reader"
+  WP_PASSWORD="local-secure-password"
+
+  # Site and images
+  SITE_URL="http://localhost:3003"
+  NEXT_PUBLIC_IMG_HOSTNAME="cms.acme.local"
+
+  # Static generation and pagination
+  NEXT_PUBLIC_REVALIDATE_STATIC="300"
+  NEXT_PUBLIC_CATEGORY_PAGE_SIZE="12"
+  NEXT_PUBLIC_POST_PAGE_SIZE="10"
+
+  # Optional: runtime port for Docker
+  PORT="3000"
+  ```
+
+- Keep `.env.local` out of version control.
+
+</Step>
+
+<Step title="Install frontend dependencies" icon="download">
+
+- Change to the `front` directory.
+- Install dependencies:
+
+  ```bash
+  cd front
+  npm install
+  ```
+
+</Step>
+
+<Step title="Run the app locally" icon="play-circle">
+
+Use one of the two approaches below to run the frontend: direct `npm dev` or Docker Compose. Both expect the same `.env.local` configuration.
+
+</Step>
+
+<Step title="Confirm GraphQL connectivity" icon="check-circle">
+
+- Start the app and open the browser at the appropriate URL:
+  - `http://localhost:3003` if using `npm run dev`.
+  - `http://localhost:3000` if using Docker Compose.
+- Navigate to a page that loads dynamic content (for example, the home page or a category).
+- In your terminal or browser devtools, confirm that requests to the WordPress GraphQL endpoint succeed (200 responses and expected payload shape).
+
+If pages fail to load or show error states, check the console logs for failed fetches to `WP_ENDPOINT` and verify your credentials.
+
+</Step>
+
+</Steps>
+
+### Choose a local run approach
+
+<Tabs>
+
+<Tab title="npm dev" icon="terminal">
+
+Run the frontend directly in Next.js dev mode for the fastest feedback loop.
+
+1. Start the dev server on port `3003`:
+
+   ```bash
+   cd front
+   npm run dev
+   ```
+
+2. Open `http://localhost:3003` in your browser.
+3. Make code changes under `front/app` or `front/components` and rely on hot reload to see updates immediately.
+
+This approach is ideal while actively developing components and templates.
+
+</Tab>
+
+<Tab title="Docker Compose" icon="package">
+
+Run the frontend via Docker Compose to approximate the production container environment.
+
+1. Ensure `front/.env.local` is present with all required variables.
+2. From the `front` directory, start the stack:
+
+   ```bash
+   cd front
+   docker compose up --build
+   ```
+
+3. Open `http://localhost:3000` in your browser.
+4. Logs from the running container appear in your terminal and use the `json-file` logging driver.
+
+This approach is useful when testing the container, cache headers, and runtime behavior closer to production.
+
+</Tab>
+
+</Tabs>
+
+## GraphQL data flow and Apollo usage
+
+The frontend consumes all WordPress content through a server‑side Apollo client.
+
+### Apollo client configuration
+
+The Apollo client lives in `front/app/lib/server/graphql/apollo.ts` and is configured using:
+
+- `WP_ENDPOINT` — backend GraphQL URL.
+- `WP_USER` and `WP_PASSWORD` — credentials for authenticated calls (for example, via basic auth headers).
+
+<Callout kind="alert">
+
+When you change `WP_ENDPOINT`, `WP_USER`, or `WP_PASSWORD`, or adjust the Apollo client configuration, you affect every data‑fetching operation in the app. Test a variety of pages (home, categories, posts, search) after such changes.
+
+</Callout>
+
+The client is initialized on the server and reused by GraphQL query helpers. The code uses standard Apollo patterns; no extra monitoring or external APM integrations are present beyond fetch logging configured in `next.config.ts`.
+
+### GraphQL operations location
+
+All GraphQL operations are defined as `.gql` files under:
+
+- `front/app/lib/server/graphql/**`
+
+Each `.gql` file describes a query or mutation, for example:
+
+- Post detail by slug.
+- Category listing with pagination.
+- Navigation menus.
+
+Query helper functions import these operations and execute them via the shared Apollo client. Components and templates call these helpers rather than using the client directly.
+
+### Mapping data into components and templates
+
+The typical pattern is:
+
+1. A route or template resolves what content it needs based on the URL (for example, a slug or category).
+2. It calls a GraphQL helper associated with that content type, which:
+   - Imports the relevant `.gql` document.
+   - Executes it via the shared Apollo client.
+   - Maps the raw WordPress data into a shape friendly to React components (for example, extracting only the fields needed for the template).
+3. The template passes this data down to presentational components.
+
+This mapping layer keeps React components relatively agnostic of WordPress’s exact schema shape. When the schema evolves, you typically adjust the `.gql` queries and mapping helpers before touching components.
+
+## Static generation, ISR, and previews
+
+Next.js static generation and revalidation ensure the frontend stays up to date with WordPress content.
+
+### Static generation and revalidation behavior
+
+The app uses ISR, guided by constants from `front/app/lib/constants.ts`:
+
+- Static pages are generated during the build or at first request.
+- `NEXT_PUBLIC_REVALIDATE_STATIC` (default `300` seconds) defines how long a page stays fresh.
+- After the revalidation window, the next request triggers a background regeneration.
+
+This behavior is inferred from the usage of `NEXT_PUBLIC_REVALIDATE_STATIC` and standard Next.js ISR patterns. The exact `revalidate` values for each route are defined in the route and template code.
+
+### Revalidate API route
+
+`front/app/api/revalidate/route.ts` provides a programmatic way to trigger revalidation when content changes in WordPress.
+
+Typical flow (inferred):
+
+- WordPress (or another system) calls this endpoint when relevant content changes.
+- The endpoint validates the request (for example, using a token or secret).
+- It calls Next.js revalidation primitives to update one or more paths.
+
+<Callout kind="alert">
+
+Do not change the shape or URL of the revalidate route unless you also update every system that calls it. Incorrect revalidation logic can leave stale content cached indefinitely or cause excessive rebuilds.
+
+</Callout>
+
+### Preview API route
+
+`front/app/api/preview/route.ts` enables preview mode, so editors can view unpublished or draft content.
+
+Typical flow (inferred):
+
+- An editor opens a preview link from WordPress that points to this route with a token or identifier.
+- The route activates preview mode and redirects to the appropriate frontend path.
+- Templates check preview mode to decide whether to fetch draft content.
+
+As with the revalidate route, treat changes here as high impact on editorial workflows.
+
+## Tracing backend changes to frontend output
+
+Use this section to understand how a change in WordPress or its GraphQL schema propagates through the frontend.
+
+### Schema changes
+
+When the GraphQL schema changes (for example, new fields added, fields renamed, or removed), follow this path:
+
+1. **GraphQL schema update (WordPress)**  
+   The WordPress GraphQL plugin or backend developers introduce schema changes.
+
+2. **.gql documents under `front/app/lib/server/graphql/**`**  
+   - Update relevant `.gql` files to match the new schema.
+   - Add newly available fields if needed.
+   - Remove or rename fields that no longer exist.
+
+3. **Mapping helpers and TypeScript types (if present)**  
+   - Adjust mapping functions that shape GraphQL results into component props.
+   - Update any local TypeScript types describing GraphQL payloads.
+
+4. **Templates and components**  
+   - Update components that rely on changed fields.
+   - If you remove fields, confirm that templates render sensible fallbacks.
+
+Success signal: pages that use the updated schema render without GraphQL errors, and the new or changed data appears correctly.
+
+### Routing changes
+
+Routing is driven by the catch‑all route and how it interprets WordPress data:
+
+1. **WordPress URL or structure changes**  
+   - Slugs, category paths, or permalink structures change in WordPress.
+
+2. **Catch‑all route under `front/app/[[...route]]`**  
+   - Adjust logic that maps the incoming path segments to WordPress entities.
+   - Ensure that the route still picks the correct template for each content type.
+
+3. **Templates and their route configs**  
+   - If a template assumes a specific URL format, update it to match the new structure.
+   - Confirm that `generateStaticParams` or similar helpers (if used) still cover all expected paths.
+
+Success signal: outdated URLs redirect or 404 as intended, and new URLs render the correct templates with the expected data.
+
+### Content changes
+
+Content changes are the most common and routine scenario:
+
+1. **Editors update content in WordPress**  
+   - Existing posts, pages, or categories are edited.
+   - New content is published.
+
+2. **ISR or revalidate route**  
+   - Either ISR automatically refreshes pages after the `NEXT_PUBLIC_REVALIDATE_STATIC` interval.
+   - Or external systems call the `revalidate` API route to refresh specific pages immediately.
+
+3. **Frontend templates**  
+   - On next request after revalidation, templates fetch updated content and render the new output.
+
+Success signal: editors see changes reflected on the live site within the expected time window or immediately after triggering a revalidate.
+
+## Safe extension guidelines
+
+This section describes where it is safe to extend or customize the frontend, and which areas require extra caution.
+
+### Safe areas to extend
+
+In general, extending the system is safest when you:
+
+- Add new components with clear boundaries.
+- Add new templates or route segments without changing existing ones.
+- Reuse existing GraphQL helpers and patterns.
+
+Safe places to add or modify code include:
+
+- **Presentational components** under `front/components` or similar:
+  - Create new UI building blocks.
+  - Keep them driven by props rather than hard‑coding CMS details.
+- **New templates** under `front/app`:
+  - Add new folders for additional content types or landing pages.
+  - Plug them into the routing logic in a way that does not change existing routes.
+- **New GraphQL `.gql` documents and helpers**:
+  - Add new queries to fetch additional data.
+  - Use the existing Apollo client and mapping patterns.
+
+These changes are largely additive and have limited blast radius if you follow existing conventions.
+
+### Sensitive areas and cautions
+
+Some parts of the codebase affect global behavior and should be treated as high‑risk.
+
+<Callout kind="alert">
+
+Before changing any of the areas below, coordinate with the team, add tests where possible, and validate in a staging environment.
+
+</Callout>
+
+- **Catch‑all route `front/app/[[...route]]`**  
+  - Changing how this route resolves paths can break navigation for the entire site.
+  - Any refactor here should include regression checks for home, category, post, archive, and custom pages.
+
+- **Apollo client configuration `front/app/lib/server/graphql/apollo.ts`**  
+  - Modifying headers, authentication, or error handling affects every GraphQL request.
+  - Confirm that all expected use cases (public pages, authenticated previews, large listings) still work.
+
+- **Operational endpoints `front/app/api/revalidate/route.ts` and `front/app/api/preview/route.ts`**  
+  - Changes here can break content freshness or preview flows.
+  - Keep their contracts stable unless you control and update all callers.
+
+- **Global constants `front/app/lib/constants.ts`**  
+  - Drastic changes to revalidation or pagination defaults can produce unexpected load or UX changes.
+  - Consider overriding values via environment variables rather than hard‑coding new defaults where possible.
+
+### Extension checklist
+
+Use this quick checklist when planning a change:
+
+- Are you **adding** a new component or template without changing public contracts?  
+  → Generally safe. Follow existing patterns and naming.
+
+- Are you changing **routing behavior** or **URL structures**?  
+  → High impact. Map old to new behavior explicitly and test extensively.
+
+- Are you touching **Apollo client**, **revalidate/preview routes**, or **core constants**?  
+  → High impact. Review with another engineer and verify in staging.
+
+- Are you updating `.gql` files due to a **schema change**?  
+  → Safe if you scope the change and update mappings/components accordingly.
+
+## What’s next
+
+Once you are comfortable with the architecture and local setup:
+
+<Columns cols={3}>
+
+<Card title="Quickstart" href="/quickstart" icon="zap" cta="Spin up a project">
+
+Get a practical walkthrough of creating and modifying pages end‑to‑end.
+
+</Card>
+
+<Card title="Components catalog" href="/components" icon="code" cta="Reuse building blocks">
+
+Explore available UI components and how to use them in templates.
+
+</Card>
+
+<Card title="Steps component" href="/components/steps" icon="list-ordered" cta="Standardize flows">
+
+Learn how to use the Steps component to document and guide user flows.
+
+</Card>
+
+</Columns>

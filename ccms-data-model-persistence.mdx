@@ -1,0 +1,434 @@
+---
+title: Data model and persistence in CCMS
+description: Understand how CCMS data is stored in WordPress, which tables and options matter, and how this impacts GraphQL, migrations, and redirects.
+---
+
+## Purpose and scope
+
+CCMS builds on a standard WordPress + plugins stack. To reason about migrations, debugging, and schema evolution, you need a clear map of where each data type lives and how the CCMS frontend reaches it.
+
+This page focuses on:
+
+- What kinds of data CCMS manages
+- How and where that data is persisted in WordPress and plugins
+- How the MWP plugin and WPGraphQL read and expose that data
+- Which data is critical for system integrity during migrations
+
+<Callout kind="alert">
+
+Breaking or dropping the storage for routing, template selection, or core settings can make content unreachable or cause failed builds, even if posts and media still exist. Treat these as part of the content model, not auxiliary metadata.
+
+</Callout>
+
+## Data types in CCMS
+
+CCMS coordinates several categories of content and configuration across WordPress and plugins:
+
+- **Editorial content**: posts, pages, and any custom post types (CPTs) that the frontend queries.
+- **Taxonomies and categories**: built-in taxonomies like `category` and `post_tag`, plus any custom taxonomies attached to CPTs.
+- **Media**: attachments referenced from posts (images, documents, embeds).
+- **Routing and redirects**: canonical URLs from posts and taxonomies, plus explicit redirects via the Redirection plugin.
+- **Site settings and configuration**: CCMS/MWP configuration, on‑demand revalidation settings, and other operational switches.
+- **SEO metadata**: Yoast SEO post‑level meta, global SEO configuration options, and any CCMS-specific SEO toggles (for example, `mwp_seo_settings`).
+- **Template selection**: which frontend template or site variant a given WordPress site should use.
+
+Later sections map each of these to specific storage locations.
+
+## Core WordPress storage model
+
+WordPress stores most CCMS‑relevant data in a small number of core tables, repeated per site on multisite:
+
+- `wp_posts`
+- `wp_postmeta`
+- `wp_terms` and `wp_termmeta`
+- `wp_term_taxonomy`
+- `wp_term_relationships`
+- `wp_options`
+- `wp_users` and `wp_usermeta`
+
+On multisite, each site gets its own set of tables with a blog‑specific prefix (for example, `wp_2_posts`, `wp_2_options`).
+
+<Callout kind="info">
+
+On multisite, CCMS treats each site (each blog ID) as its own content domain. The MWP plugin reads options per site using functions such as `get_blog_option($blog_id, 'mwp_template_settings_settings', 'template_id')` for features like template selection.
+
+</Callout>
+
+### Editorial content and ACF fields
+
+Editorial content centers around the `wp_posts` table and is extended primarily via ACF stored in `wp_postmeta`.
+
+- **Posts/pages/CPTs**: stored as rows in `wp_posts` with `post_type` (`post`, `page`, or a custom type) and `post_status`.
+- **ACF fields**: each ACF field value is stored as a row in `wp_postmeta`, keyed by `meta_key` (for example, `hero_title`, `page_layout`) and `meta_value` (stringified value).
+
+When WPGraphQL is installed and configured:
+
+- **Post and page fields** are exposed as GraphQL types (`Post`, `Page`, or custom types).
+- **ACF fields** attached to a post type are exposed via WPGraphQL for ACF as nested GraphQL fields, so the frontend can query them directly without touching `wp_postmeta`.
+
+This means that ACF schema changes correspond to shape changes in the GraphQL API, even though the underlying persistence remains `wp_postmeta`.
+
+### Taxonomies, categories, and media
+
+Taxonomies and media follow standard WordPress patterns:
+
+- **Terms and categories**:
+  - `wp_terms` stores term slugs and names.
+  - `wp_term_taxonomy` assigns terms to taxonomies (`category`, `post_tag`, custom taxonomies).
+  - `wp_term_relationships` links posts to terms.
+  - `wp_termmeta` stores term‑level metadata (for example, images, descriptions, or custom fields).
+
+- **Media**:
+  - Attachments are `post_type = 'attachment'` rows in `wp_posts`.
+  - Additional data (ALT text, captions, ACF image fields) lives in `wp_postmeta`.
+
+WPGraphQL exposes taxonomies and media as GraphQL types that resolve to these tables; CCMS queries them through GraphQL, not directly via SQL.
+
+## Storage by area
+
+The following tabs group data by primary storage area so you can reason about migrations and impacts without inspecting the database directly.
+
+<Tabs>
+
+<Tab title="WordPress core" icon="database">
+
+### Core editorial data
+
+WordPress core tables back any content the CCMS frontend renders:
+
+- **`wp_posts`**: source of truth for:
+  - Posts, pages, CPTs
+  - Attachments (media)
+  - Menu items (if used via posts)
+- **`wp_postmeta`**:
+  - ACF field values (via ACF)
+  - Yoast per‑post SEO fields (for example, `meta_key = '_yoast_wpseo_canonical'`)
+  - Other plugin‑specific per‑post metadata
+
+<Callout kind="alert">
+
+If you migrate data between environments, treat `wp_posts` and `wp_postmeta` as an atomic unit. Dropping `wp_postmeta` rows breaks ACF fields, Yoast SEO, and any CCMS/MWP metadata, even though posts still exist.
+
+</Callout>
+
+### Taxonomies and relationships
+
+Core taxonomy tables underpin category‑based navigation and listing pages:
+
+- **`wp_terms` / `wp_term_taxonomy` / `wp_term_relationships`**:
+  - Define categories, tags, and any custom taxonomies.
+  - Link posts to terms, which CCMS uses for listing pages and filters.
+- **`wp_termmeta`**:
+  - Stores taxonomy‑specific metadata (for example, hero images or descriptions on category pages).
+
+Breaking taxonomy tables affects category pages and any frontends that expect taxonomic navigation.
+
+### Users and authors
+
+- **`wp_users` / `wp_usermeta`**:
+  - Store authors, editors, and administrator accounts.
+  - Author information may be exposed via GraphQL to show bylines or author pages.
+
+While user data is not usually part of CCMS content deployments, it matters for editorial workflows and permissions.
+
+</Tab>
+
+<Tab title="Plugin options" icon="settings">
+
+### Site settings and configuration (wp_options)
+
+CCMS and the MWP plugin persist configuration in `wp_options` via the WordPress Settings API.
+
+The `back/mwp/src/Admin/SettingsRegistry.php` code:
+
+- Registers **settings sections**.
+- Persists settings as **arrays** stored under section names in `wp_options`.
+- Reads values using `get_option($section)` or via a `Settings::get(...)` wrapper.
+
+Key option groups that affect CCMS behavior include:
+
+<ParamField body="mwp_seo_settings" param-type="array" show-location="false">
+
+SEO‑related configuration for CCMS/MWP, stored in `wp_options` and read via `Settings::get('mwp_seo_settings', ...)`. These values influence how SEO data is exposed to the frontend and GraphQL (for example, controlling canonical URL behavior or toggling SEO integration).
+
+</ParamField>
+
+<ParamField body="mwp_template_settings_settings" param-type="array" show-location="false">
+
+Template selection configuration. On multisite, the MWP plugin reads this via `get_blog_option($blog_id, 'mwp_template_settings_settings', 'template_id')` to decide which frontend template a site uses in the admin bar and related behaviors.
+
+</ParamField>
+
+<ParamField body="mwp_odr_settings" param-type="array" show-location="false">
+
+On‑demand revalidation base settings, referenced by `back/mwp/src/Revalidation.php`. Includes keys such as `frontend_url` and `revalidate_secret_key` used when emitting revalidation requests to the frontend.
+
+</ParamField>
+
+<ParamField body="mwp_odr_post_update_settings" param-type="array" show-location="false">
+
+Per‑event on‑demand revalidation configuration, also read in `Revalidation.php`. Controls which paths or tags to revalidate when posts update, and toggles for post‑update behavior.
+
+</ParamField>
+
+These option arrays are critical to keep in sync when moving environments (for example, from staging to production) because they encode frontend URLs and secrets.
+
+<Callout kind="alert">
+
+If you copy the database between environments without updating `mwp_odr_settings.frontend_url` or `revalidate_secret_key`, on‑demand revalidation can silently target the wrong frontend or fail authentication, causing stale pages even though content updates succeed.
+
+</Callout>
+
+</Tab>
+
+<Tab title="Redirects & routing" icon="arrow-right">
+
+### Redirect persistence via Redirection plugin
+
+MWP integrates with the Redirection plugin to surface redirects to the frontend and GraphQL.
+
+In `back/mwp/src/Graphql.php`, the plugin:
+
+- **Queries `$wpdb` directly** against Redirection tables:
+  - `wp_redirection_items`
+  - `wp_redirection_groups`
+- Exposes these redirects under the GraphQL schema (for example, a `mwpRouting` type) alongside other routing settings.
+
+As a result:
+
+- Redirect rules are not stored in `wp_posts` or `wp_options`.
+- They live **exclusively in the Redirection tables**, which are per site (for example, `wp_2_redirection_items` on multisite).
+
+The frontend can:
+
+- Query redirect rules via GraphQL.
+- Apply them at build time or runtime to map legacy paths to canonical URLs.
+
+### Canonical URLs and Yoast SEO routing
+
+MWP also reads Yoast SEO canonical metadata to understand routing:
+
+- `Graphql.php` uses `get_post_meta(..., '_yoast_wpseo_canonical', true)` in a debug query.
+- This value is stored in `wp_postmeta` and influences canonical URL decisions.
+
+The combination of Redirection rules and canonical meta determines how the frontend should treat:
+
+- Legacy URLs or slugs
+- Canonical vs non‑canonical routes
+- SEO‑driven URL overrides
+
+<Callout kind="alert">
+
+If you migrate a site without copying `wp_redirection_items` / `wp_redirection_groups`, the frontend loses visibility into redirects while posts still exist. Users can hit outdated URLs and see 404s or duplicate content until you re‑import Redirection rules.
+
+</Callout>
+
+</Tab>
+
+<Tab title="SEO" icon="bar-chart">
+
+### Yoast SEO storage
+
+Yoast SEO stores data in two primary places:
+
+- **Per‑post meta in `wp_postmeta`**:
+  - Keys follow the pattern `_yoast_wpseo_*` (for example, `_yoast_wpseo_title`, `_yoast_wpseo_metadesc`, `_yoast_wpseo_canonical`).
+  - MWP specifically reads `_yoast_wpseo_canonical` in `Graphql.php` to inspect canonical URLs in certain debug flows.
+
+- **Global settings in `wp_options`**:
+  - Stored in options such as `wpseo_titles` and related Yoast options.
+  - These control global SEO defaults and behavior that WPGraphQL and the frontend can use for site‑level SEO configuration.
+
+### GraphQL exposure
+
+When WPGraphQL and the Yoast integration are enabled:
+
+- Yoast post meta and global options are exposed via GraphQL fields.
+- MWP augments this by registering additional schema fields (for example, under `mwpSeo` in `Graphql.php`) and reading:
+
+  - Option‑backed values via `Settings::get(...)`.
+  - Yoast meta via `get_post_meta` for canonical URLs and related SEO data.
+
+The frontend then:
+
+- Queries SEO fragments (for example, from `front/app/lib/server/graphql/fragments`) to combine Yoast SEO fields with MWP SEO settings.
+- Computes per‑page SEO tags, canonical URLs, and structured data on the frontend, without hitting the WordPress DB directly at runtime.
+
+</Tab>
+
+</Tabs>
+
+## Template selection and multisite behavior
+
+Template selection determines which frontend template or site variant a WordPress site uses. In CCMS, this is persisted per site and read by the MWP plugin.
+
+Key aspects:
+
+- **Storage**:
+  - Template settings are stored in `wp_options` under `mwp_template_settings_settings`.
+- **Multisite read pattern**:
+  - `back/mwp/mwp.php` reads the per‑site configuration using:
+    - `get_blog_option($blog_id, 'mwp_template_settings_settings', 'template_id')`
+  - This enables multisite admin bar behavior where each site can select a different template.
+
+Operationally, changing or migrating these settings:
+
+- Alters which frontend project (or configuration) a given site uses.
+- Can break preview/admin integrations if template IDs or frontend projects change without updating the option.
+
+<Callout kind="info">
+
+When cloning environments in multisite, check that `mwp_template_settings_settings` is correct for each blog ID. A staging clone pointing to production frontend templates can cause confusing preview behavior and cross‑environment coupling.
+
+</Callout>
+
+## How MWP accesses persisted data
+
+The MWP plugin is the bridge between raw WordPress storage and the GraphQL API consumed by the CCMS frontend.
+
+Key patterns visible in the codebase:
+
+- **Settings via `Settings::get(...)`**:
+  - `back/mwp/src/Graphql.php` and `back/mwp/src/Revalidation.php` call `Settings::get(group, key, default)` to retrieve option‑backed settings.
+  - These groups map to `wp_options` entries registered by `SettingsRegistry.php`.
+
+- **Direct `$wpdb` access for redirects**:
+  - `Graphql.php` queries Redirection tables (`redirection_items`, `redirection_groups`) with raw SQL to gather redirect data.
+  - This bypasses the options API and core post tables because redirects live in custom tables.
+
+- **Yoast meta via `get_post_meta`**:
+  - Used in `Graphql.php` debug queries to inspect canonical URLs (`'_yoast_wpseo_canonical'`).
+  - Stored in `wp_postmeta` and then potentially surfaced via GraphQL.
+
+Understanding these access patterns helps you:
+
+- Trace how a given GraphQL field is computed (options vs meta vs custom tables).
+- Predict the impact of schema or plugin changes on the frontend API.
+- Plan migrations that preserve both data and the logic that derives fields from it.
+
+## Data critical for system integrity
+
+Some data is more than content: it defines how content is exposed and how the system behaves. Losing or corrupting it can break builds, routing, or SEO.
+
+<Callout kind="alert">
+
+During migrations or environment clones, validate not only that posts and media exist, but also that routing, SEO, and template selection data are intact. Losing these can make a site appear down even if all posts are present.
+
+</Callout>
+
+### Critical categories
+
+- **Routing and redirects**:
+  - Redirection plugin tables: `wp_redirection_items`, `wp_redirection_groups`.
+  - Canonical URL meta: `_yoast_wpseo_canonical` in `wp_postmeta`.
+  - Impact: missing data leads to 404s, duplicate content, and broken legacy URLs.
+
+- **Site settings and configuration**:
+  - MWP option groups in `wp_options`:
+    - `mwp_seo_settings` (SEO integration behavior).
+    - `mwp_template_settings_settings` (template selection).
+    - `mwp_odr_settings` (revalidation base URL and secret).
+    - `mwp_odr_post_update_settings` (post‑update revalidation behavior).
+  - Impact: wrong or missing values can:
+    - Break on‑demand revalidation.
+    - Point a site at the wrong frontend template.
+    - Downgrade or misconfigure SEO behavior.
+
+- **ACF schema‑backed fields**:
+  - ACF field values in `wp_postmeta`.
+  - Impact: missing values break page layouts, components, and often cause runtime errors in the frontend when GraphQL returns nulls or unexpected shapes.
+
+- **SEO configuration**:
+  - Yoast global options (`wpseo_titles` and related).
+  - Yoast per‑post meta (`_yoast_wpseo_*` keys).
+  - Impact: degraded SEO, incorrect title and meta tags, inconsistent canonical behavior.
+
+- **Multisite site boundaries**:
+  - Blog‑specific options and Redirection tables.
+  - Impact: cross‑site bleed or misrouted traffic if you merge or rewrite tables without preserving per‑blog prefixes and IDs.
+
+## Migration and change impact checklist
+
+Use this section as a reasoning guide when planning migrations or structural changes.
+
+<ExpandableGroup>
+
+<Expandable title="Moving content between environments" default-open="true">
+
+- Confirm that the following are moved together for each site:
+
+  - `wp_posts` and `wp_postmeta`
+  - `wp_terms`, `wp_term_taxonomy`, `wp_term_relationships`, `wp_termmeta`
+  - ACF field groups and configuration (as code or via export/import)
+  - Yoast options (for example, `wpseo_titles`) and `_yoast_wpseo_*` meta
+
+- After migration, verify via GraphQL:
+
+  - Posts and pages return expected ACF fields.
+  - SEO fragments include Yoast data and any `mwpSeo` fields.
+  - Canonical URLs and slugs match expectations.
+
+</Expandable>
+
+<Expandable title="Preserving routing and redirects">
+
+- Export and import Redirection tables (`redirection_items`, `redirection_groups`) per site.
+- Confirm that:
+
+  - GraphQL routing/redirect queries surface expected rules.
+  - Legacy URLs redirect correctly in the frontend.
+
+- Keep canonical meta (`_yoast_wpseo_canonical`) intact when migrating `wp_postmeta`.
+
+</Expandable>
+
+<Expandable title="Aligning configuration and secrets">
+
+- Review these `wp_options` entries per environment:
+
+  - `mwp_template_settings_settings` (template IDs/selection)
+  - `mwp_odr_settings` (`frontend_url`, `revalidate_secret_key`, etc.)
+  - `mwp_odr_post_update_settings` (per‑event behavior)
+  - Any CCMS‑specific `mwp_seo_settings` entries
+
+- For cloned environments:
+
+  - Update `frontend_url` to point to the correct frontend instance.
+  - Rotate or adjust `revalidate_secret_key` if environments should not share secrets.
+  - Ensure template IDs map to valid templates in the target environment.
+
+</Expandable>
+
+</ExpandableGroup>
+
+## What to reference next
+
+For a deeper understanding of how this persisted data flows into the frontend:
+
+<Columns cols={2}>
+
+<Card
+  title="CCMS architecture and content flow"
+  href="/ccms-architecture-content-flow"
+  icon="cloud"
+  cta="See the end-to-end pipeline"
+  horizontal="true"
+>
+
+Trace how data moves from WordPress, through MWP and GraphQL, into the CCMS frontend.
+
+</Card>
+
+<Card
+  title="MWP backend plugin details"
+  href="/ccms-backend-mwp-plugin"
+  icon="code"
+  cta="Understand plugin internals"
+  horizontal="true"
+>
+
+Review how the MWP plugin defines GraphQL schema, reads options, and integrates with redirects and SEO.
+
+</Card>
+
+</Columns>

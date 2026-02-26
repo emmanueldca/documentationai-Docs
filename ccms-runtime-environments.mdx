@@ -1,0 +1,428 @@
+---
+title: Configure CCMS runtime environments
+description: Set up local and production runtime environments for the CCMS frontend and WordPress backend, including Docker, Node, and required environment variables.
+---
+
+## Runtime model overview
+
+CCMS runs as a WordPress-based backend (content and GraphQL) and a Next.js frontend, each with its own runtime and environment configuration.
+
+The backend runs via the root `docker-compose.yml` (MySQL, WordPress, Adminer). The frontend runs either in Docker using `front/compose.yaml` and `front/Dockerfile` or directly with Node using `next dev` from `front/package.json`.
+
+## Prerequisites
+
+<Callout kind="info">
+
+To run CCMS locally, install:
+
+- Docker Desktop or a compatible Docker Engine
+- Docker Compose (if not bundled with Docker Desktop)
+- Node.js 20.x (for direct frontend development)
+- A WordPress instance configured via the root `docker-compose.yml` (local) or an existing WP environment (shared or production)
+
+Confirm `docker --version` and `node --version` before continuing. Node must report a 20.x release.
+
+</Callout>
+
+## Local runtime options
+
+Use Docker for both layers in parity with production, or run the frontend with Node directly for development while keeping WordPress in Docker.
+
+<Tabs>
+
+<Tab title="Docker-first" icon="package">
+
+Use Docker to run both the backend (WordPress stack) and the frontend.
+
+<Steps>
+
+<Step title="Start the backend stack" icon="terminal">
+
+From the repository root, create a `.env` file based on `.env.sample` and then start the services.
+
+```bash
+cp .env.sample .env
+
+# Edit .env to set ports, database credentials, and WordPress settings
+docker compose up -d
+```
+
+Success looks like:
+
+- Containers for MySQL, WordPress, and Adminer are running: `docker ps` shows them as `healthy` or `up`.
+- WordPress responds on the configured `WORDPRESS_PORT` (for example, `http://localhost:8080`).
+- Adminer responds on `ADMINER_PORT` (for example, `http://localhost:8081`).
+
+</Step>
+
+<Step title="Configure frontend environment" icon="settings">
+
+Create a `.env.local` file in the `front` directory for the Next.js app.
+
+```bash
+cd front
+cp .env.local.example .env.local  # if available, otherwise create manually
+```
+
+Set the required frontend variables as described in [Frontend environment variables](#frontend-environment-variables). In particular, point `WP_ENDPOINT` at your local WordPress GraphQL endpoint and set `SITE_URL` to the URL you use to access the frontend container.
+
+</Step>
+
+<Step title="Run frontend in Docker" icon="play-circle">
+
+Use the frontend `compose.yaml` to build and run the Next.js app in Docker.
+
+```bash
+cd front
+docker compose -f compose.yaml up --build
+```
+
+This uses `front/Dockerfile`, maps container port `3000` to host port `3000`, loads `.env.local`, and configures json-file logging with rotation.
+
+Success looks like:
+
+- The frontend container is running and healthy: `docker ps` lists the `front` service.
+- `http://localhost:3000` (or your mapped port) responds with the CCMS frontend.
+- The frontend can fetch content from WordPress without GraphQL errors in the logs.
+
+</Step>
+
+</Steps>
+
+</Tab>
+
+<Tab title="Node-first frontend" icon="terminal">
+
+Use Docker only for the backend, and run the frontend directly with Node for faster iteration.
+
+<Steps>
+
+<Step title="Start backend via root Docker Compose" icon="package">
+
+From the repository root, use the same backend startup as in the Docker-first flow:
+
+```bash
+cp .env.sample .env  # if not already created
+docker compose up -d
+```
+
+Confirm that WordPress and MySQL respond and that you can reach the WordPress instance on `WORDPRESS_PORT`.
+
+</Step>
+
+<Step title="Configure frontend .env.local" icon="settings">
+
+Inside the `front` directory, create or edit `.env.local`:
+
+```bash
+cd front
+touch .env.local
+```
+
+Populate all variables listed in [Frontend environment variables](#frontend-environment-variables), pointing to your local WordPress endpoint and setting the public configuration for pagination, images, and static regeneration.
+
+</Step>
+
+<Step title="Run Next.js dev server" icon="play-circle">
+
+Use the `dev` script defined in `front/package.json`, which runs Next.js on port `3003`:
+
+```bash
+cd front
+npm install
+npm run dev
+```
+
+`npm run dev` internally executes:
+
+```bash
+next dev -p 3003
+```
+
+Success looks like:
+
+- The dev server logs `ready - started server on 0.0.0.0:3003`.
+- `http://localhost:3003` serves the CCMS frontend.
+- Changes in the `front` code hot-reload in the browser.
+
+</Step>
+
+</Steps>
+
+</Tab>
+
+</Tabs>
+
+## Backend environment variables (docker-compose)
+
+The backend stack is defined in the root `docker-compose.yml` and configured via an `.env` file derived from `.env.sample`. These variables control MySQL, WordPress, and Adminer.
+
+All of these backend variables are **infrastructure configuration** and should be treated as secrets when they contain credentials.
+
+<ParamField body="MYSQL_DATABASE" param-type="string" required="true" show-location="false">
+
+Name of the WordPress MySQL database. Use a non-default name in shared or production environments to avoid collisions.
+
+</ParamField>
+
+<ParamField body="MYSQL_PORT" param-type="integer" required="true" show-location="false">
+
+Host port that maps to the MySQL container. Only expose this port externally if you need direct DB access from outside Docker.
+
+</ParamField>
+
+<ParamField body="MYSQL_USER" param-type="string" required="true" show-location="false">
+
+MySQL application user with privileges on `MYSQL_DATABASE`. This value is a secret and must not be shared in logs or client-side code.
+
+</ParamField>
+
+<ParamField body="MYSQL_PASSWORD" param-type="string" required="true" show-location="false">
+
+Password for `MYSQL_USER`. This is a secret and should only exist in server-side configuration or secret stores.
+
+</ParamField>
+
+<ParamField body="MYSQL_ROOT_PASSWORD" param-type="string" required="true" show-location="false">
+
+Root password for MySQL. Treat this as a high-value secret and avoid using it for application connections.
+
+</ParamField>
+
+<ParamField body="WORDPRESS_PORT" param-type="integer" required="true" show-location="false">
+
+Host port that maps to the WordPress container (HTTP). Use this to construct `WP_ENDPOINT` for the frontend when running locally.
+
+</ParamField>
+
+<ParamField body="ADMINER_PORT" param-type="integer" required="true" show-location="false">
+
+Host port that maps to the Adminer container. Use this for database inspection, migrations, and troubleshooting.
+
+</ParamField>
+
+<Callout kind="alert">
+
+Treat all MySQL credentials (`MYSQL_USER`, `MYSQL_PASSWORD`, `MYSQL_ROOT_PASSWORD`) as secrets. Store them only in secure secret stores and environment management systems, never in source control.
+
+</Callout>
+
+## Frontend environment variables
+
+The frontend is a Next.js app defined in `front`. It uses environment variables from `.env.local` (for local dev and Docker) and from your deployment platform (for staging and production).
+
+### GraphQL connectivity
+
+`front/app/lib/server/graphql/apollo.ts` defines the Apollo `HttpLink` using WordPress GraphQL variables.
+
+<ParamField body="WP_ENDPOINT" param-type="string" required="true" show-location="false">
+
+Full URL to the WordPress GraphQL endpoint. For a local Docker setup, this typically looks like `http://localhost:8080/graphql` using your `WORDPRESS_PORT`. The Apollo client uses this endpoint for all content queries.
+
+</ParamField>
+
+<ParamField body="WP_USER" param-type="string" required="true" show-location="false">
+
+WordPress user name used for Basic Authentication to the GraphQL endpoint. Stored and read server-side only in `apollo.ts`. This is a secret and must never appear in client-side bundles.
+
+</ParamField>
+
+<ParamField body="WP_PASSWORD" param-type="string" required="true" show-location="false">
+
+Password for `WP_USER` used in the Basic Authorization header for WordPress GraphQL requests. This is a secret and must only be configured as a server environment variable.
+
+</ParamField>
+
+Apollo constructs the `Authorization` header as a Basic token based on `WP_USER` and `WP_PASSWORD`, and configures queries with `no-cache` by default.
+
+### Public frontend configuration
+
+These environment variables influence rendering behavior and client-visible configuration. Variables prefixed with `NEXT_PUBLIC_` are sent to the client bundle and must not contain secrets.
+
+<ParamField body="SITE_URL" param-type="string" required="true" show-location="false">
+
+Canonical base URL for the frontend (for example, `http://localhost:3000` in Docker or `http://localhost:3003` in Node dev). Use the deployed domain in staging and production to ensure correct absolute URLs and redirects.
+
+</ParamField>
+
+<ParamField body="NEXT_PUBLIC_IMG_HOSTNAME" param-type="string" required="true" show-location="false">
+
+Hostname that Next.js allows for external images (for example, your WordPress media domain). `front/next.config.ts` uses this to configure `images.domains` and to apply caching headers for image responses.
+
+</ParamField>
+
+<ParamField body="NEXT_PUBLIC_REVALIDATE_STATIC" param-type="integer" required="false" show-location="false">
+
+Default Incremental Static Regeneration (ISR) revalidation interval in seconds. Next.js uses this as the `revalidate` value for statically generated routes when no more specific value is set. Set low values in development and higher values in production.
+
+</ParamField>
+
+<ParamField body="NEXT_PUBLIC_CATEGORY_PAGE_SIZE" param-type="integer" required="true" show-location="false">
+
+Number of posts to show per category listing page. Used by frontend pagination logic to determine how many items to request and render per page.
+
+</ParamField>
+
+<ParamField body="NEXT_PUBLIC_POST_PAGE_SIZE" param-type="integer" required="true" show-location="false">
+
+Number of posts to show on generic listing or index pages. Like `NEXT_PUBLIC_CATEGORY_PAGE_SIZE`, this affects GraphQL query limits and pagination UI.
+
+</ParamField>
+
+<ParamField body="PORT" param-type="integer" required="false" show-location="false">
+
+Port the Next.js server listens on when running the built app directly (for example, in some deployment environments). Locally, `npm run dev` uses `3003` via `next dev -p 3003` as defined in `front/package.json`, regardless of `PORT`.
+
+</ParamField>
+
+## Operational secrets and protected endpoints
+
+Operational routes under `front/app/api` use dedicated secret keys for cache revalidation and preview mode. These secrets must never be exposed to clients or stored in public locations.
+
+### Revalidation secret
+
+`front/app/api/revalidate/route.ts` validates incoming requests using a bearer token.
+
+<ParamField body="WP_REVALIDATE_SECRET_KEY" param-type="string" required="true" show-location="false">
+
+Secret used by the `/api/revalidate` endpoint. The route checks that the `Authorization` header equals `Bearer ${WP_REVALIDATE_SECRET_KEY}` before triggering tag- and path-based revalidation. This must only be known by your content automation or CI systems that call the revalidate API.
+
+</ParamField>
+
+### Preview secret and draft mode
+
+`front/app/api/preview/route.ts` controls preview (draft) mode for content editors.
+
+<ParamField body="WP_PREVIEW_SECRET_KEY" param-type="string" required="true" show-location="false">
+
+Secret used by the `/api/preview` endpoint. The route validates that the `secret` query parameter matches this key and that `id` and `type` are present before enabling Next.js draft mode. Treat this as a secret shared only with your editorial tooling and WordPress integration.
+
+</ParamField>
+
+When a request passes preview validation:
+
+- The route sets `draftMode.enable()` with no caching (`revalidate = 0` and `dynamic = force-dynamic`).
+- The frontend bypasses ISR caches and always fetches fresh content for that session.
+- This allows viewing unpublished or draft content from WordPress through CCMS.
+
+<Callout kind="alert">
+
+Treat `WP_REVALIDATE_SECRET_KEY`, `WP_PREVIEW_SECRET_KEY`, `WP_USER`, `WP_PASSWORD`, and all MySQL credentials as secrets:
+
+- Do not log them or echo them to console.
+- Do not expose them via `NEXT_PUBLIC_` variables.
+- Store them in a secret manager or encrypted environment configuration in production.
+
+</Callout>
+
+## Build and rendering behavior by environment
+
+Several environment variables influence how Next.js builds and serves pages, particularly around caching, ISR, and template resolution.
+
+### Template base directory
+
+The frontend uses a configurable template base directory to resolve layout and content templates.
+
+<ParamField body="TEMPLATE_BASE_DIRECTORY" param-type="string" required="false" show-location="false">
+
+Filesystem path or relative directory that the frontend reads to load page and component templates. Use different values per environment if you maintain separate template sets for staging and production.
+
+</ParamField>
+
+Environment-specific behavior:
+
+- **Local**: Point `TEMPLATE_BASE_DIRECTORY` to a local directory under the repo for rapid iteration.
+- **Staging/production**: Use a stable path that is baked into the deployed image or mounted as a volume, so deployments are reproducible.
+
+### ISR and revalidate behavior
+
+`front/next.config.ts` configures caching headers and enables fetch logging. Combined with ISR options on pages, the following variables shape runtime caching:
+
+- `NEXT_PUBLIC_REVALIDATE_STATIC` establishes a baseline revalidate interval for statically generated routes.
+- `/api/revalidate` plus `WP_REVALIDATE_SECRET_KEY` enable **on-demand revalidation**:
+  - WordPress or CI can call this endpoint when content changes.
+  - The route uses tags or paths to invalidate specific pages.
+  - Responses after revalidation show updated content without waiting for the natural `revalidate` interval.
+
+Success signals for ISR:
+
+- Logs show `revalidated` messages when `fetch` or route handlers re-render content.
+- HTTP responses include updated cache headers configured via `next.config.ts`.
+
+### Draft mode and previews
+
+The preview route (`/api/preview`) is configured with `dynamic = force-dynamic` and `revalidate = 0`, ensuring that:
+
+- Preview responses always bypass static caches.
+- Draft content is fetched directly from WordPress using `WP_ENDPOINT` with Basic auth.
+- Users in draft mode see changes immediately, regardless of `NEXT_PUBLIC_REVALIDATE_STATIC`.
+
+When exiting draft mode (for example, via a dedicated route that calls `draftMode.disable()`), requests return to standard ISR and caching behavior.
+
+## Secrets vs non-secrets summary
+
+Use this section as a quick classification reference when wiring environment management in different environments.
+
+### Secrets (server-side only)
+
+The following variables must **never** be exposed to clients, logged, or stored in source control:
+
+- **Database and infrastructure**
+  - `MYSQL_USER`
+  - `MYSQL_PASSWORD`
+  - `MYSQL_ROOT_PASSWORD`
+- **WordPress authentication**
+  - `WP_USER`
+  - `WP_PASSWORD`
+- **Operational keys**
+  - `WP_REVALIDATE_SECRET_KEY`
+  - `WP_PREVIEW_SECRET_KEY`
+
+These should live in:
+
+- Local: `.env` and `.env.local` files ignored by version control.
+- Staging/production: Secret stores (for example, cloud provider secret managers, CI/CD variable stores, Kubernetes secrets).
+
+### Non-secrets (configurable but safe to expose)
+
+The following variables are configuration parameters and safe to include in client bundles where they use the `NEXT_PUBLIC_` prefix. Still manage them per environment, but they do not need secret-level protection:
+
+- Backend and infrastructure
+  - `MYSQL_DATABASE`
+  - `MYSQL_PORT`
+  - `WORDPRESS_PORT`
+  - `ADMINER_PORT`
+- Frontend configuration
+  - `SITE_URL`
+  - `NEXT_PUBLIC_IMG_HOSTNAME`
+  - `NEXT_PUBLIC_REVALIDATE_STATIC`
+  - `NEXT_PUBLIC_CATEGORY_PAGE_SIZE`
+  - `NEXT_PUBLIC_POST_PAGE_SIZE`
+  - `PORT` (for some runtimes)
+  - `TEMPLATE_BASE_DIRECTORY` (unless it encodes sensitive paths or data)
+
+If you use additional variables for analytics, logging, or feature flags, apply the same rule: anything prefixed with `NEXT_PUBLIC_` is visible to browsers and must not contain secrets.
+
+## Next steps
+
+Once your runtime and environments are configured:
+
+<Columns cols={2}>
+
+<Card
+  title="Review CCMS architecture and content flow"
+  href="/ccms-architecture-content-flow"
+  icon="bar-chart"
+  cta="Understand how requests move through CCMS"
+  horizontal="true"
+/>
+
+<Card
+  title="Inspect the frontend implementation"
+  href="/ccms-frontend"
+  icon="code"
+  cta="See how pages, templates, and GraphQL integrate"
+  horizontal="true"
+/>
+
+</Columns>

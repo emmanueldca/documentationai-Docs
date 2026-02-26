@@ -1,0 +1,480 @@
+---
+title: Error handling and failure scenarios for CCMS
+description: Trace errors across WordPress, GraphQL, and the frontend, with concrete symptoms, root causes, and safe mitigation steps for CCMS failures.
+---
+
+## How errors propagate through CCMS
+
+Failures in CCMS move through three main layers: WordPress and the plugin, the GraphQL API, and the frontend build/runtime.
+
+At a high level:
+
+- Backend (WordPress + plugin) exposes data and routes via extended WPGraphQL entrypoints such as `mwpSettings`, `mwpRouting`, and `mwpSeo`.
+- GraphQL client code in the frontend (`apollo.ts`) sends no-cache queries to the backend and throws an `ApolloError` on any failure.
+- Frontend runtime loaders (for example `front/app/[[...route]]/page.tsx` and template pages) interpret missing data or thrown `ApolloError` instances as page failures, logging errors and eventually falling back to `notFound()`.
+
+This page helps you recognize where a failure originates, what you see at each layer, and how to fix it safely.
+
+<Callout kind="alert">
+
+Production incidents often involve more than one layer at once (for example, a malformed content structure in WordPress plus missing revalidation). Always confirm which layer fails first before applying fixes.
+
+</Callout>
+
+---
+
+## Quick path: diagnose a broken page end-to-end
+
+Use this generic flow whenever a page shows 404, blank content, or obviously stale data.
+
+<Steps>
+
+<Step title="Confirm the visible symptom" icon="alert-triangle">
+
+- Check whether the page shows:
+  - A 404 or custom not-found page.
+  - A blank or partially rendered page.
+  - Correct structure but outdated content.
+- Capture the full URL and whether draft mode is enabled for your session.
+
+</Step>
+
+<Step title="Inspect frontend runtime logs" icon="terminal">
+
+- Open the browser devtools console.
+- Look for `console.error` messages from template pages like `Error fetching ...` or any `ApolloError` stack traces.
+- If you have access to frontend server logs, check the logs for the same timestamp and route.
+
+</Step>
+
+<Step title="Check GraphQL responses" icon="code">
+
+- Reproduce the failing route locally or in staging.
+- Enable network inspection and look for the GraphQL request corresponding to the route.
+- Confirm whether the response has:
+  - `errors` populated.
+  - An HTTP error code.
+  - Missing or `null` data for the requested query (for example missing `mwpRouting` or `mwpSettings`).
+
+</Step>
+
+<Step title="Verify WordPress plugin and content" icon="settings">
+
+- In WordPress, check that the CCMS/MWP plugin is active and the `mwp`-specific WPGraphQL schema extensions (`mwpSettings`, `mwpRouting`, `mwpSeo`) respond as expected.
+- Inspect the specific content entry for malformed fields: required relationships missing, unexpected types, or broken blocks.
+
+</Step>
+
+<Step title="Check build and revalidation state" icon="package">
+
+- If the issue is stale content, check whether on-demand revalidation (implemented in `back/mwp/src/Revalidation.php` and `front/app/api/revalidate/route.ts`) is firing for the affected route.
+- For complete outages or widespread 404s, review the latest CI workflows in `.github/workflows/front_*` to confirm the last build and deploy succeeded.
+
+</Step>
+
+</Steps>
+
+When you know which layer fails first, use the scenario breakdowns below.
+
+---
+
+## Failure scenarios by layer
+
+<Tabs>
+
+<Tab title="Backend (WordPress & plugin)" icon="database">
+
+### Backend failure scenarios
+
+The backend layer includes WordPress, the CCMS/MWP plugin, and the extended WPGraphQL schema implemented in `back/mwp/src/Graphql.php` and `back/mwp/src/Revalidation.php`.
+
+<ExpandableGroup>
+
+<Expandable title="Misconfigured WordPress or plugin settings" default-open="true">
+
+Misconfiguration in WordPress or the CCMS plugin prevents WPGraphQL from exposing the expected `mwp` entrypoints or from triggering revalidation correctly.
+
+<Callout kind="alert">
+
+Misconfigured settings can break routing or revalidation globally, affecting multiple pages at once.
+
+</Callout>
+
+**Failing layer**
+
+- WordPress core configuration
+- CCMS/MWP plugin configuration
+- WPGraphQL integration provided by `Graphql.php`
+
+**Typical symptoms**
+
+- Many or all routes return 404 via `front/app/[[...route]]/page.tsx` because `getEntity(path)` cannot find any matching entity.
+- GraphQL queries for `mwpSettings`, `mwpRouting`, or `mwpSeo` return `null` or `errors` instead of structured data.
+- On-demand revalidation does not run after content changes, so statically generated pages become stale.
+
+**Likely root causes**
+
+- CCMS/MWP plugin disabled or not installed on the WordPress instance.
+- WPGraphQL plugin disabled, incompatible version, or misconfigured.
+- Broken configuration in `mwpSettings` (for example base URL, route prefix, or environment-specific values).
+- Incorrect permissions or non-public post types so the GraphQL API does not expose content as expected.
+- Revalidation secret or endpoint configuration in `back/mwp/src/Revalidation.php` does not match the frontend `front/app/api/revalidate/route.ts`.
+
+**First checks / logs**
+
+- In WordPress admin:
+  - Confirm that WPGraphQL and CCMS/MWP plugins are active.
+  - Check plugin settings pages for environment-specific values (API URLs, secrets).
+- In backend logs:
+  - Look for PHP errors thrown from `back/mwp/src/Graphql.php` or `back/mwp/src/Revalidation.php`.
+  - Check web server logs for requests to the revalidation endpoint and their HTTP status.
+- In GraphQL tooling (GraphiQL or similar):
+  - Run a simple query for `mwpSettings` and `mwpRouting` to confirm the schema is available and returns data.
+
+**Mitigations / safe fixes**
+
+- Reactivate required plugins and re-save configuration pages to rebuild internal caches.
+- Align configuration between backend and frontend:
+  - Confirm revalidation secret and target URL match between `Revalidation.php` and `front/app/api/revalidate/route.ts`.
+  - Ensure route base paths and domains match what the frontend expects.
+- If plugin upgrades changed the schema, coordinate with frontend to adjust queries before rolling back or forward.
+- After fixing configuration, trigger a manual revalidation or full rebuild to clear stale static pages.
+
+</Expandable>
+
+<Expandable title="Invalid or malformed content structures">
+
+Broken content structures in WordPress cause schema-compliant GraphQL responses with missing or `null` fields, or explicit GraphQL errors if resolver assumptions break.
+
+**Failing layer**
+
+- WordPress content modeling
+- Custom fields, blocks, or relationships used by the CCMS templates
+
+**Typical symptoms**
+
+- Specific pages or sections render as blank while the rest of the site works.
+- The frontend logs `console.error('Error fetching ...')` inside template pages, followed by a runtime fallback to `notFound()`.
+- GraphQL responses for the affected entities show unexpected `null` fields or resolver errors.
+
+**Likely root causes**
+
+- Required relationships (for example linked pages, menus, or media) missing from a content item.
+- Custom field data saved in an unexpected shape (wrong type, missing keys) relative to what the GraphQL resolvers or frontend expect.
+- Manually edited JSON blocks or shortcodes that break parsing in the resolver.
+- Partial migrations where some posts or taxonomies were updated to a new structure but templates still assume the old structure.
+
+**First checks / logs**
+
+- Reproduce the issue in staging and inspect:
+  - GraphQL response payloads for the specific entity.
+  - Browser console for `ApolloError` messages and the `console.error` output from template components.
+- In WordPress:
+  - Open the problematic content entry and validate fields:
+    - All required fields present.
+    - Repeater or nested fields contain consistent structures.
+- In backend logs:
+  - Search for PHP notices or warnings thrown during GraphQL resolution for that post ID or route.
+
+**Mitigations / safe fixes**
+
+- Normalize the content:
+  - Fill in missing required fields.
+  - Remove or correct malformed JSON blocks or shortcodes.
+- If resolver assumptions about structure changed during a deployment, either:
+  - Migrate existing content to the new shape, or
+  - Temporarily relax the frontend/template assumptions by adding null-checks.
+- For recurring patterns, introduce validation rules or editor guidelines to prevent saving malformed structures.
+
+</Expandable>
+
+</ExpandableGroup>
+
+</Tab>
+
+<Tab title="GraphQL layer" icon="code">
+
+### GraphQL and query failure scenarios
+
+The GraphQL layer covers schema extensions, queries executed from the frontend, and error propagation via the Apollo client.
+
+<ExpandableGroup>
+
+<Expandable title="GraphQL schema changes or incompatibilities" default-open="true">
+
+Changes to the WPGraphQL or CCMS schema (for example in `back/mwp/src/Graphql.php`) can break existing queries the frontend issues.
+
+<Callout kind="alert">
+
+Breaking schema changes (field removals, type changes) can cause entire templates to fail and trigger `notFound()` even though WordPress content still exists.
+
+</Callout>
+
+**Failing layer**
+
+- WPGraphQL schema extensions (backend)
+- GraphQL query definitions in the frontend
+
+**Typical symptoms**
+
+- Affected routes return 404 via `notFound()` while others still work.
+- Browser console shows `ApolloError` with messages like:
+  - `Cannot query field ... on type ...`
+  - `Field ... of type ... must not be null`
+- GraphQL network responses include an `errors` array with schema-related messages.
+
+**Likely root causes**
+
+- Backend changed or removed fields in the schema exposed by `Graphql.php` (for example renamed `mwpRouting` fields).
+- New non-nullable fields were added without default values, and existing content does not satisfy the new constraints.
+- Frontend deployed with queries referencing fields that only exist in a later plugin version, but WordPress is still on an older version.
+
+**First checks / logs**
+
+- Inspect GraphQL responses in devtools:
+  - Confirm the exact error messages and which fields or types are affected.
+- In a GraphQL IDE against the same backend:
+  - Run the failing queries manually to confirm they fail outside the app.
+  - Inspect the GraphQL schema introspection for the presence and type of problematic fields.
+- In deployment history:
+  - Compare versions of the CCMS plugin and frontend around the incident time.
+
+**Mitigations / safe fixes**
+
+- Align versions:
+  - Roll forward or back either the backend plugin or the frontend until schema and queries match.
+- Avoid hard-breaking changes:
+  - When evolving the schema, add new fields as nullable and keep old fields until all frontend consumers are updated.
+- On the frontend:
+  - Add defensive null handling so non-critical fields do not cause the entire query or template to fail.
+
+</Expandable>
+
+<Expandable title="Query shape errors and runtime ApolloError failures">
+
+Even when the schema is stable, incorrect query definitions or runtime usage can trigger `ApolloError` from the Apollo client in `front/app/lib/server/graphql/apollo.ts`.
+
+**Failing layer**
+
+- GraphQL client code and query documents in the frontend
+- Apollo client configuration (no error link; errors surface as thrown `ApolloError`)
+
+**Typical symptoms**
+
+- Template components catch an `ApolloError`, log `console.error('Error fetching ...')`, and return `null`.
+- The catch-all route in `front/app/[[...route]]/page.tsx` eventually sees missing entities from `getEntity(path)` and calls `notFound()`.
+- CI or preview builds that execute queries during static generation fail for specific pages.
+
+**Likely root causes**
+
+- Queries built with incorrect variables (wrong path, missing IDs).
+- Mixed concerns in one query causing failures if any nested resolver throws.
+- Misuse of query fragments or inline fragments that do not line up with the current schema.
+- Network-level issues (timeouts, auth problems to the WP endpoint) that Apollo surfaces as `ApolloError`.
+
+**First checks / logs**
+
+- Review the specific template file making the failing query:
+  - Confirm variables passed into the query match the route params and expected types.
+- Enable logging of full query and variables (in local or staging) to see the exact request payload.
+- In network panel:
+  - Check the GraphQL HTTP status, response time, and any transport-level errors.
+
+**Mitigations / safe fixes**
+
+- Narrow the query:
+  - Split large queries into smaller ones so non-critical data failures do not break routing.
+- Validate variables:
+  - Add guards before executing queries to ensure route params and IDs are present and valid.
+- Enhance error handling:
+  - Keep the existing pattern of catching `ApolloError` but consider differentiating between:
+    - Hard failures that should trigger `notFound()`.
+    - Soft failures where a partial UI is acceptable.
+
+</Expandable>
+
+</ExpandableGroup>
+
+</Tab>
+
+<Tab title="Frontend build & runtime" icon="monitor">
+
+### Frontend build and runtime scenarios
+
+The frontend layer includes CI builds, Docker image creation and deployment, static page generation, and runtime behavior in `[[...route]]/page.tsx` and template components.
+
+<ExpandableGroup>
+
+<Expandable title="Frontend build or deploy failures" default-open="true">
+
+Build and deploy workflows under `.github/workflows/front_*` orchestrate CI, image builds, and deployments via SSH and `docker-compose`. Failures here can leave the site outdated or partially deployed.
+
+<Callout kind="alert">
+
+Broken or stuck builds can deploy a partial image set or skip deployment entirely, leading to missing pages or stale behavior across the site.
+
+</Callout>
+
+**Failing layer**
+
+- CI workflows:
+  - `front_stage.yaml` (PR builds)
+  - `front_semantic_version.yaml` (versioning on main)
+  - `front_build.yaml` (image build to `registry.corp-apps.com/image/mwp`)
+  - `front_deploy_*.yaml` (deploy to BEL2/LR via SSH and `docker-compose`)
+- Container runtime on target hosts
+
+**Typical symptoms**
+
+- New content or schema changes in WordPress do not appear even after revalidation attempts.
+- Some environments (for example BEL2 but not LR) show older versions of the frontend.
+- CI shows failed jobs or pending workflow runs for the front stack.
+
+**Likely root causes**
+
+- Vault secrets or registry credentials missing or expired, causing build or deploy steps to fail.
+- Self-hosted or shared runners unavailable, leading to stuck or delayed workflows.
+- Errors in `docker-compose` image tag replacement (for example incorrect `sed` substitutions) leaving old images running.
+- Build-time GraphQL calls failing (if static generation hits the backend during build) due to backend downtime or schema mismatch.
+
+**First checks / logs**
+
+- Check GitHub Actions:
+  - Inspect the status of `front_stage`, `front_semantic_version`, `front_build`, and `front_deploy_*` workflows around the incident.
+  - Open failed jobs and review logs for:
+    - Authentication errors to Vault or Docker registry.
+    - SSH failures to BEL2/LR hosts.
+- On deployment hosts:
+  - Confirm the running container image tag matches the expected semantic version or commit.
+  - Inspect application logs for startup errors.
+
+**Mitigations / safe fixes**
+
+- Restore secrets:
+  - Refresh Vault tokens or Docker registry credentials referenced in the workflows.
+- Stabilize runners:
+  - Ensure required runners are online and have access to necessary networks and resources.
+- When builds failed mid-way:
+  - Re-run `front_build` and `front_deploy_*` workflows once dependencies are restored.
+  - Avoid manual edits on servers; prefer re-running the automated pipeline to keep environment parity.
+
+</Expandable>
+
+<Expandable title="Runtime routing failures and notFound behavior">
+
+Routing logic in `front/app/[[...route]]/page.tsx` and template pages handles missing entities and GraphQL errors by falling back to `notFound()`, which renders the not-found page.
+
+**Failing layer**
+
+- Frontend runtime execution of route loaders and templates
+- Dynamic routing logic based on `getEntity(path)`
+
+**Typical symptoms**
+
+- Single pages or groups of routes resolve to the not-found page while others work.
+- When draft mode is enabled, draft entries appear correctly, but published pages still 404 for non-draft sessions.
+- Browser console shows:
+  - `console.error('Error fetching ...')` from template pages.
+  - Potential stack traces from `ApolloError` before the fallback to `notFound()`.
+
+**Likely root causes**
+
+- `getEntity(path)` is unable to resolve the path to an entity because:
+  - Backend `mwpRouting` data is missing or inconsistent.
+  - The path does not match any configured pattern after recent changes.
+- Template code:
+  - Treats non-critical missing data as a hard error and returns `null`, leading upstream to `notFound()`.
+  - Does not properly respect draft mode when deciding whether to show unpublished content.
+- Draft mode only active for specific sessions, masking issues during development but impacting production users.
+
+**First checks / logs**
+
+- Reproduce the issue with draft mode:
+  - Compare behavior with draft mode on and off for the same user and path.
+- Inspect the code path:
+  - Review `front/app/[[...route]]/page.tsx` for how it calls `getEntity(path)` and handles missing entities.
+  - Check template implementations for where they catch `ApolloError` and return `null`.
+- In frontend logs (server-side or client-side):
+  - Correlate errors and `console.error` output with requests that end in `notFound()`.
+
+**Mitigations / safe fixes**
+
+- Adjust template error handling:
+  - Distinguish between:
+    - Genuine routing misses, which should trigger `notFound()`.
+    - Partial content issues, which should degrade gracefully instead of dropping the entire page.
+- Fix routing data:
+  - Ensure backend `mwpRouting` exposes all required paths and that paths are stable across schema or slug changes.
+- Use draft mode intentionally:
+  - Avoid relying on draft mode to hide structural routing issues; treat discrepancies between draft and non-draft behavior as signals of misconfiguration.
+
+</Expandable>
+
+<Expandable title="Stale content and revalidation issues">
+
+Static pages can become stale when on-demand revalidation fails or is misconfigured between backend and frontend.
+
+**Failing layer**
+
+- Revalidation hooks in `back/mwp/src/Revalidation.php`
+- Frontend revalidation API in `front/app/api/revalidate/route.ts`
+- Static generation cache in the frontend framework
+
+**Typical symptoms**
+
+- Content updates appear in WordPress and GraphQL, but users still see old content in production.
+- Revalidation API calls from the backend to the frontend return non-2xx responses or time out.
+- Only some routes update, particularly those with unusual or deep paths.
+
+**Likely root causes**
+
+- Revalidation secret mismatch between backend and frontend.
+- URL for the revalidation endpoint in `Revalidation.php` points to the wrong environment or hostname.
+- Recent deploy changed route patterns or cache keys without updating revalidation targets.
+- Network restrictions preventing backend from reaching the frontend revalidation endpoint.
+
+**First checks / logs**
+
+- In backend logs:
+  - Look for revalidation request attempts and their HTTP response codes.
+- In frontend logs:
+  - Check `front/app/api/revalidate/route.ts` access logs to confirm receipt of revalidation requests.
+- In GraphQL:
+  - Confirm that the latest content shows in direct queries; if so, the issue is cache/static, not data.
+
+**Mitigations / safe fixes**
+
+- Align revalidation configuration:
+  - Confirm secrets and URLs are identical between backend config and frontend API route expectations.
+- For urgent hotfixes:
+  - Trigger a manual global revalidation or a fresh full build and deploy to reset all static content.
+- Longer term:
+  - Monitor revalidation failures and treat repeated failures as production alerts.
+
+</Expandable>
+
+</ExpandableGroup>
+
+</Tab>
+
+</Tabs>
+
+---
+
+## What to do next
+
+Once you identify the failing layer and scenario:
+
+- For backend or schema issues, coordinate changes with the team maintaining the CCMS/MWP plugin and WordPress instance.
+- For GraphQL or template issues, adjust queries and error handling patterns, keeping the existing `ApolloError` and `notFound()` flow in mind.
+- For build and revalidation issues, stabilize CI workflows and confirm that `Revalidation.php` and `front/app/api/revalidate/route.ts` agree on secrets and endpoints.
+
+<Columns cols={3}>
+
+<Card title="Architecture and content flow" href="/ccms-architecture-content-flow" icon="cloud" cta="Understand data flow" />
+
+<Card title="Frontend behavior" href="/ccms-frontend" icon="monitor" cta="Review routing & runtime" />
+
+<Card title="Backend plugin details" href="/ccms-backend-mwp-plugin" icon="database" cta="Inspect schema extensions" />
+
+</Columns>

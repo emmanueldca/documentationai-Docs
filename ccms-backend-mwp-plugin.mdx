@@ -1,0 +1,445 @@
+---
+title: CCMS backend and MWP plugin
+description: Understand how the CCMS WordPress multisite backend and custom MWP plugin work together, including responsibilities, GraphQL schema, revalidation, and admin surfaces.
+---
+
+## Overview
+
+CCMS uses a WordPress multisite network plus a custom plugin under `back/mwp` (referred to here as the MWP plugin) to drive content and configuration for the frontend application.
+
+The MWP plugin bootstraps backend behavior, exposes configuration via GraphQL, and provides admin pages operators use to control cache, revalidation, previews, and SEO.
+
+<Callout kind="info">
+
+This page focuses on how CCMS uses WordPress and the MWP plugin as a backend for a separate frontend app. It does not replace WordPress core or plugin vendor documentation.
+
+</Callout>
+
+## Plugin architecture and responsibilities
+
+The plugin entrypoint lives at `back/mwp/mwp.php`. It loads the autoloader and initializes core components such as settings, revalidation, and GraphQL integration.
+
+At a high level, the MWP plugin is responsible for:
+
+- Bootstrapping CCMS-specific behavior on every relevant request
+- Managing settings that the frontend reads via GraphQL
+- Integrating with the frontend revalidation API when content changes
+- Extending WPGraphQL with CCMS types and queries
+- Exposing operational admin pages for cache, revalidation, preview, and SEO-related actions
+
+### Bootstrap: `back/mwp/mwp.php`
+
+The bootstrap file:
+
+- Loads the plugin autoloader
+- Instantiates:
+
+  - **Settings** management
+  - **Revalidation** integration (`back/mwp/src/Revalidation.php`)
+  - **GraphQL** schema extension (`back/mwp/src/Graphql.php`)
+  - **Admin pages** under `back/mwp/src/Admin/Pages/*`
+
+Because this is a multisite installation, the bootstrap is activated at the network level but can expose different behavior per site depending on configuration.
+
+<Callout kind="alert">
+
+Changes to how `back/mwp/mwp.php` initializes components can affect every site in the network and may break the schema contract with the frontend. Coordinate any modifications with frontend owners.
+
+</Callout>
+
+## Multisite behavior and configuration scope
+
+CCMS runs on WordPress multisite, which introduces **network-level** and **site-level** scopes.
+
+### Network-level vs site-level responsibilities
+
+In a typical CCMS deployment:
+
+- **Network-level configuration** (Network Admin):
+
+  - Plugin activation (`back/mwp/mwp.php` must be network-activated)
+  - Global plugin dependencies (WPGraphQL, ACF, Yoast SEO, Lazy Blocks, and others from `back/mwp/README.md`)
+  - Multisite creation and core WordPress network settings
+
+- **Site-level configuration** (per site admin):
+
+  - Content modeling (ACF, Lazy Blocks usage per site)
+  - SEO configuration via Yoast SEO and the MWP SEO admin page
+  - Per-site cache and preview behavior
+  - Per-site revalidation options exposed by MWP
+
+The specific options exposed by each admin page depend on implementation details inside `back/mwp/src/Admin/Pages/*`. Use the descriptions below as functional guidance and validate the exact field names and toggles in the WordPress admin.
+
+<Callout kind="info">
+
+Field names, toggle labels, and exact groupings in the admin UI are not documented here intentionally. Always verify the current options directly in the WordPress multisite Network Admin and each site’s WP Admin.
+
+</Callout>
+
+### What is documented vs what must be validated in WP admin
+
+Documented at code level:
+
+- **Where behavior is implemented** (PHP paths under `back/mwp/src`)
+- **Which admin pages exist** and their intended purpose
+- **How scope works** (network vs site)
+
+Must be validated directly in WordPress:
+
+- The **exact names** of settings, checkboxes, and dropdowns
+- **Default values** and any environment-specific overrides
+- Any **site-specific configuration differences** beyond schema-level behavior
+
+When you onboard a new environment or site, plan to:
+
+- Confirm that the plugin is **network-activated**
+- Walk through each MWP admin page per site to confirm settings align with the frontend’s expectations
+
+## GraphQL schema and frontend contract
+
+GraphQL integration is the primary contract between WordPress and the CCMS frontend. The MWP plugin extends WPGraphQL via `back/mwp/src/Graphql.php`.
+
+### Schema extension entrypoint
+
+`back/mwp/src/Graphql.php` is responsible for:
+
+- Registering CCMS-specific types
+- Registering queries and fields that the frontend relies on
+- Wiring resolvers to WordPress settings and post/meta data
+
+The schema includes (at least) the following high-level entrypoints:
+
+- `mwpSettings` — CCMS-related settings exposed to the frontend
+- `mwpRouting` — routing information including redirect resolution
+- `mwpSeo` — SEO metadata, typically backed by Yoast SEO fields
+
+<Callout kind="alert">
+
+Treat the GraphQL schema defined by `back/mwp/src/Graphql.php` as a stable contract. Changes to type shapes, field names, or required arguments can break the frontend and any other consumers.
+
+</Callout>
+
+### Core queries and types
+
+At a functional level, the schema behaves as follows:
+
+- **`mwpSettings`**
+
+  - Returns configuration the frontend uses for behavior such as base URLs, feature flags, or integration toggles.
+  - Data is sourced from plugin settings and possibly from WordPress options.
+
+- **`mwpRouting`**
+
+  - Exposes routing data, including:
+
+    - Page resolution based on paths or identifiers
+    - Redirects, with resolver logic that determines target URLs and HTTP status codes
+
+  - The redirect resolver logic allows the frontend to implement consistent navigation and redirect handling without reimplementing WordPress-specific rules.
+
+- **`mwpSeo`**
+
+  - Returns SEO metadata for content entities, often integrating with Yoast SEO.
+  - The frontend uses this to populate `<head>` tags with titles, descriptions, canonical URLs, and other SEO fields.
+
+The specific field lists, arguments, and nested types are defined in `back/mwp/src/Graphql.php`. Validate those details when you make frontend schema queries or update the backend.
+
+### How the frontend consumes GraphQL
+
+The frontend application calls the WPGraphQL endpoint and queries the extended schema.
+
+For example, a typical query might:
+
+- Fetch `mwpSettings` at build time or on boot to configure the app
+- Fetch `mwpRouting` for a given path to determine whether content exists or a redirect should occur
+- Fetch `mwpSeo` for a page to render SEO metadata
+
+<Callout kind="alert">
+
+Before deploying schema changes from `back/mwp/src/Graphql.php`, run end-to-end checks on the frontend to ensure all GraphQL queries remain valid and that routing and SEO behavior match expectations.
+
+</Callout>
+
+## Revalidation: connecting WordPress changes to the frontend
+
+The MWP plugin integrates WordPress events with the frontend’s revalidation API so that content changes in WordPress are reflected in the frontend app.
+
+### Revalidation implementation
+
+Core revalidation logic lives in `back/mwp/src/Revalidation.php`. This component:
+
+- Hooks into WordPress content lifecycle events (for example, publish, update, delete)
+- Determines which paths or resources must be revalidated in the frontend
+- Talks to the frontend’s revalidation endpoint located at `front/app/api/revalidate/route.ts`
+
+Operational access to revalidation is provided via an admin page at `back/mwp/src/Admin/Pages/OnDemandRevalidation.php`.
+
+The exact hooks and mapping between WordPress entities and frontend paths are implementation-dependent inside `Revalidation.php`. Inspect that file when you need to:
+
+- Add new content types that should trigger revalidation
+- Adjust which paths are invalidated for a given change
+- Update authentication or payload formats for the frontend revalidation API
+
+### Frontend revalidation API contract
+
+The plugin expects the frontend to implement a revalidation endpoint at:
+
+- `front/app/api/revalidate/route.ts`
+
+This endpoint:
+
+- Receives revalidation requests from WordPress
+- Authenticates the request (for example, via a shared secret or token)
+- Triggers cache invalidation or route regeneration for the requested paths
+
+<Callout kind="alert">
+
+Keep the contract between `back/mwp/src/Revalidation.php` and `front/app/api/revalidate/route.ts` in sync: payload shape, auth, and response expectations must match. A mismatch can silently prevent content updates from reaching the frontend.
+
+</Callout>
+
+## Admin pages provided by MWP
+
+The MWP plugin registers several admin pages under `back/mwp/src/Admin/Pages/*`. These pages provide operational interfaces for cache management, revalidation, preview behavior, and SEO integration.
+
+The following subsections describe each page functionally. Validate specific controls and layout in the WordPress admin.
+
+### Cache admin page
+
+Path: `back/mwp/src/Admin/Pages/Cache.php` (file name inferred from folder; confirm exact file if needed).
+
+Purpose:
+
+- Provide operators with cache-related actions for the CCMS frontend and/or WordPress layer.
+- Typical responsibilities include:
+
+  - Clearing or warming caches related to content served through GraphQL
+  - Triggering site-level or global cache flushes that affect the frontend
+
+Use this page when:
+
+- Content changes are not appearing despite revalidation
+- You deploy schema or plugin updates and want to ensure a clean cache state
+
+### General settings admin page
+
+Path: `back/mwp/src/Admin/Pages/General.php` (inferred).
+
+Purpose:
+
+- Expose general CCMS-related settings that do not belong solely to SEO, cache, or preview.
+
+Examples of what may live here (confirm in the UI):
+
+- Frontend base URL or environment-specific URLs
+- Global toggles that influence how GraphQL fields are populated
+- Site-level switches for enabling or disabling features
+
+This page often bridges the gap between WordPress and frontend behavior by storing settings that `mwpSettings` reads and surfaces via GraphQL.
+
+### On-demand revalidation admin page
+
+Path: `back/mwp/src/Admin/Pages/OnDemandRevalidation.php`.
+
+Purpose:
+
+- Provide a manual, operator-friendly interface for triggering revalidation of selected routes or site-wide content.
+- Surface status or logs related to revalidation requests, depending on implementation.
+
+Use this page when:
+
+- You want to force the frontend to refresh specific pages or sections after content changes
+- You are debugging the WordPress-to-frontend revalidation flow
+
+<Callout kind="info">
+
+Automatic hooks in `back/mwp/src/Revalidation.php` should handle common content changes. The OnDemandRevalidation page is mainly for manual intervention and debugging.
+
+</Callout>
+
+### Preview admin page
+
+Path: `back/mwp/src/Admin/Pages/Preview.php`.
+
+Purpose:
+
+- Configure and manage preview flows between WordPress and the frontend app.
+- Typically involved when editors need to preview drafts or unpublished changes on the frontend.
+
+Common behaviors:
+
+- Generating preview links that embed tokens or identifiers
+- Defining how the frontend fetches preview data from WPGraphQL
+- Controlling who can access previews and for how long
+
+Editors use this page when they need to see how content will look in the frontend before publishing.
+
+### SEO admin page
+
+Path: `back/mwp/src/Admin/Pages/Seo.php`.
+
+Purpose:
+
+- Bridge SEO controls between Yoast SEO and the CCMS frontend.
+- Expose settings that influence how `mwpSeo` resolves SEO metadata.
+
+Functional responsibilities:
+
+- Coordinating which Yoast SEO fields are surfaced in GraphQL
+- Allowing operators to tweak SEO-related defaults or overrides at the site level
+- Providing visibility into how SEO metadata will flow to the frontend
+
+<Callout kind="alert">
+
+Changes on the SEO admin page can directly affect how search engines and social platforms see the site once the frontend consumes updated `mwpSeo` data. Validate these changes in both WordPress and the frontend.
+
+</Callout>
+
+## Dependencies from `back/mwp/README.md`
+
+The MWP plugin depends on a set of WordPress plugins and tools documented in `back/mwp/README.md`. These must be installed and at compatible versions for the CCMS backend to work correctly.
+
+Core required plugins and versions include:
+
+- **WPGraphQL** `1.28.1`
+- **Advanced Custom Fields (ACF)** `6.3.6`
+- **Yoast SEO** `23.5`
+- **Lazy Blocks** (and additional plugins referenced in the README)
+
+Operational dependencies:
+
+- **WP-CLI** is used for command-line operations and may be referenced in setup scripts or multisite operations.
+- Multisite-specific steps (such as network activation, site creation, and plugin enforcement) are documented in `back/mwp/README.md`.
+
+<Callout kind="alert">
+
+Do not upgrade WPGraphQL, ACF, Yoast SEO, or Lazy Blocks without reviewing `back/mwp/README.md` and testing the MWP plugin. Version mismatches can break GraphQL schema registration, field resolution, or SEO metadata extraction.
+
+</Callout>
+
+### Multisite setup considerations
+
+The README also includes multisite setup guidance. Validate the following in each environment:
+
+- WordPress runs in **multisite** mode.
+- The MWP plugin and all required dependency plugins are:
+
+  - Installed at or above the versions listed
+  - Network-activated where appropriate
+
+- New sites follow the documented steps for:
+
+  - Setting up necessary ACF groups and fields
+  - Enabling Yoast SEO and Lazy Blocks configurations
+  - Configuring initial MWP settings in the General and SEO admin pages
+
+## How WordPress changes trigger frontend updates
+
+Putting the pieces together:
+
+1. **Content or settings change in WordPress**
+
+   - Editors update posts, custom post types, ACF fields, or settings exposed via MWP admin pages.
+   - Settings changed via MWP admin pages are typically stored in WordPress options or post meta.
+
+2. **MWP revalidation logic runs**
+
+   - `back/mwp/src/Revalidation.php` observes the change via WordPress hooks.
+   - It computes which frontend routes or resources are affected.
+
+3. **Revalidation request sent to frontend**
+
+   - The plugin calls `front/app/api/revalidate/route.ts` with:
+
+     - The list of paths or identifiers to invalidate
+     - Any required authentication or metadata
+
+4. **Frontend updates caches or regenerates routes**
+
+   - The frontend revalidation endpoint processes the request and performs:
+
+     - Cache invalidation
+     - Regeneration of static or server-rendered routes
+     - Any other framework-specific revalidation behavior
+
+5. **Subsequent frontend requests see fresh data**
+
+   - The frontend fetches updated data from WPGraphQL.
+   - GraphQL types such as `mwpSettings`, `mwpRouting`, and `mwpSeo` now reflect the new state.
+
+If any of these steps fail, content changes may not propagate. Use the OnDemandRevalidation and Cache admin pages to diagnose and force refreshes when necessary.
+
+## Runbook: validate that the MWP plugin is working
+
+Use this checklist when setting up a new environment or debugging core backend behavior.
+
+<Steps>
+
+<Step title="Confirm plugin activation and dependencies" icon="check">
+
+- In **Network Admin**, verify that the MWP plugin located at `back/mwp/mwp.php` is **network-activated**.
+- Confirm that required plugins from `back/mwp/README.md` (WPGraphQL, ACF, Yoast SEO, Lazy Blocks, others as documented) are installed and activated.
+- Check that plugin versions match or exceed the versions specified in the README.
+
+Success signal: All required plugins show as active in the Network Admin, and there are no fatal errors in the WordPress debug log related to plugin loading.
+
+</Step>
+
+<Step title="Verify GraphQL schema extension" icon="code">
+
+- Open the WPGraphQL endpoint or GraphiQL IDE for the site.
+- Inspect the schema and confirm that CCMS-specific entrypoints such as `mwpSettings`, `mwpRouting`, and `mwpSeo` are available.
+- Run a basic query against `mwpSettings` to ensure it returns data without errors.
+
+Success signal: GraphQL introspection shows the MWP types and fields, and queries against them return valid JSON.
+
+</Step>
+
+<Step title="Check MWP admin pages" icon="settings">
+
+- In the site’s WP Admin, locate the MWP-related admin menu entries backed by `back/mwp/src/Admin/Pages/*`:
+
+  - Cache
+  - General
+  - OnDemandRevalidation
+  - Preview
+  - Seo
+
+- Open each page and confirm it loads without fatal errors.
+- Review current settings and align them with environment expectations.
+
+Success signal: Each admin page renders successfully and shows settings appropriate for the site’s role (production, staging, etc.).
+
+</Step>
+
+<Step title="Test revalidation flow" icon="zap">
+
+- In the frontend environment, note the current state of a page that reads from WordPress.
+- In WordPress, change content on that page or a related setting that should affect it.
+- Wait for automatic revalidation, or trigger a manual run from the OnDemandRevalidation admin page.
+- Reload the frontend page and confirm that changes appear.
+
+Success signal: After a change and revalidation, the frontend displays updated content. If not, inspect logs for `back/mwp/src/Revalidation.php` and `front/app/api/revalidate/route.ts`.
+
+</Step>
+
+<Step title="Validate SEO and routing behavior" icon="bar-chart">
+
+- In WordPress, adjust an SEO-related value (for example, a Yoast SEO title) for a test page.
+- Query `mwpSeo` via WPGraphQL for that entity and confirm the updated value appears.
+- In the frontend, check that the `<head>` metadata now matches the updated SEO settings.
+- For routing, verify that `mwpRouting` correctly resolves existing pages and redirects.
+
+Success signal: SEO metadata and routing decisions in the frontend match the values observed via GraphQL and the WordPress admin.
+
+</Step>
+
+</Steps>
+
+## Next steps
+
+Once you understand and validate the backend and MWP plugin:
+
+- Coordinate any schema or revalidation changes between `back/mwp` and `front/app/api/revalidate/route.ts`.
+- Document environment-specific expectations (production vs staging) for MWP admin settings.
+- Add automated checks where possible to verify that `mwpSettings`, `mwpRouting`, and `mwpSeo` remain available and correctly shaped in all environments.
